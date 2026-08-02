@@ -580,6 +580,107 @@ def save_checkpoint(
     return final_dir
 
 
+def _save_merged_for_push(
+    *, trainer: Any, tokenizer: Any, merged_dir: str, log: logging.Logger
+) -> str:
+    """Materialize standalone (merged) weights from a LoRA-trained model.
+
+    Unsloth models expose save_pretrained_merged; vanilla PEFT merges the
+    adapter into the base with merge_and_unload. Either way the result is a
+    self-contained model dir a Hugging Face repo can serve without PEFT.
+    """
+    model = trainer.model
+    if hasattr(model, "save_pretrained_merged"):
+        model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
+    else:
+        merged = model.merge_and_unload()
+        merged.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+    return merged_dir
+
+
+def push_to_hf_hub(
+    *,
+    job_config: dict[str, Any],
+    final_dir: str,
+    trainer: Any = None,
+    tokenizer: Any = None,
+    logger: logging.Logger | None = None,
+) -> str | None:
+    """Push the trained artifact to the user's Hugging Face account.
+
+    Opt-in via job_config["hf_push"] = {repo, artifact: merged|adapter,
+    private}; the write token arrives as job_config["hf_token"] through the
+    worker's runtime credential exchange (never via config.json on S3).
+
+    Strictly non-fatal: the training run already succeeded, so every failure
+    here logs a warning and returns None instead of raising. The token is
+    never logged.
+    """
+    log = logger or logging.getLogger("veri.training_runtime")
+    hf = job_config.get("hf_push") or {}
+    repo_id = hf.get("repo")
+    if not repo_id:
+        return None
+
+    token = job_config.get("hf_token")
+    if not token:
+        log.warning(
+            "HF push requested for %s but no token was delivered "
+            "(credential exchange failed?); skipping push.",
+            repo_id,
+        )
+        return None
+
+    artifact = hf.get("artifact", "merged")
+    private = bool(hf.get("private", True))
+    is_adapter_ckpt = (Path(final_dir) / "adapter_config.json").exists()
+
+    try:
+        if artifact == "adapter":
+            if not is_adapter_ckpt:
+                log.warning(
+                    "HF push artifact=adapter but the checkpoint has no "
+                    "adapter_config.json (full fine-tune?); skipping push."
+                )
+                return None
+            upload_dir = final_dir
+        elif is_adapter_ckpt:
+            # merged requested from a LoRA run: materialize standalone weights
+            # next to the adapter checkpoint before uploading.
+            upload_dir = _save_merged_for_push(
+                trainer=trainer,
+                tokenizer=tokenizer,
+                merged_dir=str(Path(final_dir).parent / "merged"),
+                log=log,
+            )
+        else:
+            upload_dir = final_dir  # full fine-tune save is already standalone
+
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+        api.whoami()  # fast, clear failure on a bad/expired token
+        api.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+        log.info(
+            "Pushing %s artifact to Hugging Face repo %s (private=%s)…",
+            artifact,
+            repo_id,
+            private,
+        )
+        api.upload_folder(
+            folder_path=upload_dir,
+            repo_id=repo_id,
+            commit_message=f"Veri training job {job_config.get('job_id')} ({artifact})",
+        )
+        url = f"https://huggingface.co/{repo_id}"
+        log.info("HF push complete: %s", url)
+        return url
+    except Exception as e:  # noqa: BLE001 -- push must never fail the job
+        log.warning("HF push to %s failed (non-fatal): %s", repo_id, e)
+        return None
+
+
 # `base_model` is a free-form, user-controlled field (job_config["base_model"])
 # with NO control-plane allowlist as of this fix. Passing trust_remote_code=True makes
 # HuggingFace execute arbitrary modeling_*.py / configuration_*.py from the referenced
@@ -877,6 +978,16 @@ def _train_save_finalize(
                 wandb.finish()
         except Exception:
             pass
+
+    hf_url = push_to_hf_hub(
+        job_config=job_config,
+        final_dir=final_dir,
+        trainer=trainer,
+        tokenizer=tokenizer,
+        logger=log,
+    )
+    if hf_url:
+        result["hf_repo_url"] = hf_url
 
     return result
 

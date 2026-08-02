@@ -8,6 +8,7 @@ from veri_runner.training_runtime import (
     _apply_system_prompt,
     _load_model_and_tokenizer,
     _require_preference_columns,
+    _train_save_finalize,
     build_dpo_config_kwargs,
     build_grpo_config_kwargs,
     build_sft_config_kwargs,
@@ -17,6 +18,7 @@ from veri_runner.training_runtime import (
     load_reward_functions,
     normalize_rows,
     prerender_chat_template_rows,
+    push_to_hf_hub,
     resolve_training_rows,
     run_training,
     save_checkpoint,
@@ -1417,3 +1419,189 @@ def test_resolve_jsonl_path_never_uploads_snapshot(tmp_path, monkeypatch):
     )
 
     assert fake.requests == []
+
+
+# ---- push_to_hf_hub (opt-in end-of-training HF push) ----
+
+
+def _fake_hub(monkeypatch, record, *, whoami_fails=False, upload_fails=False):
+    """Install a fake huggingface_hub module recording HfApi calls."""
+    import sys
+    import types
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            record["token"] = token
+
+        def whoami(self):
+            if whoami_fails:
+                raise RuntimeError("401 Unauthorized: invalid token")
+            return {"name": "tester"}
+
+        def create_repo(self, repo_id, private=None, exist_ok=None):
+            record["create_repo"] = {
+                "repo_id": repo_id, "private": private, "exist_ok": exist_ok,
+            }
+
+        def upload_folder(self, folder_path, repo_id, commit_message=None):
+            if upload_fails:
+                raise RuntimeError("502 upload exploded")
+            record["upload"] = {
+                "folder_path": folder_path, "repo_id": repo_id,
+                "commit_message": commit_message,
+            }
+
+    mod = types.ModuleType("huggingface_hub")
+    mod.HfApi = FakeHfApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", mod)
+
+
+def test_push_to_hf_hub_skips_without_opt_in_or_token(tmp_path, monkeypatch):
+    # BAD/absence pair: no hf_push at all, and hf_push without a delivered
+    # token (failed credential exchange) both skip without touching the hub.
+    record = {}
+    _fake_hub(monkeypatch, record)
+    assert push_to_hf_hub(job_config={"job_id": "j1"}, final_dir=str(tmp_path)) is None
+    assert push_to_hf_hub(
+        job_config={"job_id": "j1", "hf_push": {"repo": "me/out", "artifact": "merged"}},
+        final_dir=str(tmp_path),
+    ) is None
+    assert record == {}, "no-op paths must make zero hub calls"
+
+
+def test_push_to_hf_hub_adapter_uploads_adapter_dir(tmp_path, monkeypatch):
+    # GOOD: adapter artifact pushes the PEFT checkpoint dir as-is, honoring
+    # private=False, and returns the repo URL.
+    record = {}
+    _fake_hub(monkeypatch, record)
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "adapter_model.safetensors").write_text("w")
+
+    url = push_to_hf_hub(
+        job_config={
+            "job_id": "j2",
+            "hf_push": {"repo": "acme/bot-lora", "artifact": "adapter", "private": False},
+            "hf_token": "hf_secret",
+        },
+        final_dir=str(tmp_path),
+    )
+    print("adapter push ->", url, record)
+    assert url == "https://huggingface.co/acme/bot-lora"
+    assert record["token"] == "hf_secret"
+    assert record["create_repo"] == {
+        "repo_id": "acme/bot-lora", "private": False, "exist_ok": True,
+    }
+    assert record["upload"]["folder_path"] == str(tmp_path)
+    assert "j2" in record["upload"]["commit_message"]
+
+
+def test_push_to_hf_hub_adapter_without_adapter_ckpt_skips(tmp_path, monkeypatch):
+    # BAD: artifact=adapter on a full fine-tune checkpoint (no
+    # adapter_config.json) has nothing to push — warn + skip, no hub calls.
+    record = {}
+    _fake_hub(monkeypatch, record)
+    (tmp_path / "model.safetensors").write_text("w")
+
+    url = push_to_hf_hub(
+        job_config={
+            "job_id": "j3",
+            "hf_push": {"repo": "me/out", "artifact": "adapter"},
+            "hf_token": "hf_secret",
+        },
+        final_dir=str(tmp_path),
+    )
+    assert url is None and "upload" not in record
+
+
+def test_push_to_hf_hub_merged_merges_lora_before_upload(tmp_path, monkeypatch):
+    # GOOD: merged artifact from a LoRA run merges the adapter into standalone
+    # weights (merge_and_unload) and uploads the merged dir, not the adapter.
+    record = {}
+    _fake_hub(monkeypatch, record)
+    final_dir = tmp_path / "final"
+    final_dir.mkdir()
+    (final_dir / "adapter_config.json").write_text("{}")
+
+    class FakeMerged:
+        def save_pretrained(self, d):
+            Path(d).mkdir(parents=True, exist_ok=True)
+            (Path(d) / "model.safetensors").write_text("merged")
+
+    class FakePeftModel:
+        def merge_and_unload(self):
+            return FakeMerged()
+
+    class FakeTrainer:
+        model = FakePeftModel()
+
+    class FakeTokenizer:
+        def save_pretrained(self, d):
+            (Path(d) / "tokenizer.json").write_text("{}")
+
+    url = push_to_hf_hub(
+        job_config={
+            "job_id": "j4",
+            "hf_push": {"repo": "me/merged-out", "artifact": "merged", "private": True},
+            "hf_token": "hf_secret",
+        },
+        final_dir=str(final_dir),
+        trainer=FakeTrainer(),
+        tokenizer=FakeTokenizer(),
+    )
+    print("merged push ->", url, record["upload"])
+    assert url == "https://huggingface.co/me/merged-out"
+    assert record["create_repo"]["private"] is True
+    assert record["upload"]["folder_path"] == str(tmp_path / "merged")
+    assert (tmp_path / "merged" / "model.safetensors").read_text() == "merged"
+
+
+def test_push_to_hf_hub_failures_are_nonfatal(tmp_path, monkeypatch):
+    # BAD pair: a bad token (whoami 401) and a mid-upload explosion both log
+    # and return None — the training result must survive a failed push.
+    (tmp_path / "model.safetensors").write_text("w")
+    cfg = {
+        "job_id": "j5",
+        "hf_push": {"repo": "me/out", "artifact": "merged"},
+        "hf_token": "hf_bad",
+    }
+    _fake_hub(monkeypatch, {}, whoami_fails=True)
+    assert push_to_hf_hub(job_config=cfg, final_dir=str(tmp_path)) is None
+    _fake_hub(monkeypatch, {}, upload_fails=True)
+    assert push_to_hf_hub(job_config=cfg, final_dir=str(tmp_path)) is None
+
+
+def test_train_save_finalize_threads_hf_repo_url(tmp_path, monkeypatch):
+    # GOOD: the shared finalize tail runs the push after save_checkpoint and
+    # threads the returned URL into the result dict the worker reports from.
+    import types
+
+    record = {}
+    _fake_hub(monkeypatch, record)
+
+    class FakeTrainer:
+        def train(self):
+            return types.SimpleNamespace(training_loss=0.25)
+
+        def save_model(self, d):
+            Path(d).mkdir(parents=True, exist_ok=True)
+            (Path(d) / "model.safetensors").write_text("w")
+
+    class FakeTokenizer:
+        def save_pretrained(self, d):
+            (Path(d) / "tokenizer.json").write_text("{}")
+
+    result = _train_save_finalize(
+        trainer=FakeTrainer(),
+        tokenizer=FakeTokenizer(),
+        job_config={
+            "job_id": "j6",
+            "checkpoint": {"local_output_root": str(tmp_path)},
+            "hf_push": {"repo": "me/final", "artifact": "merged"},
+            "hf_token": "hf_secret",
+        },
+        wandb_enabled=False,
+        log=__import__("logging").getLogger("test"),
+    )
+    print("finalize result ->", {k: result[k] for k in ("final_loss", "hf_repo_url")})
+    assert result["hf_repo_url"] == "https://huggingface.co/me/final"
+    assert record["upload"]["repo_id"] == "me/final"

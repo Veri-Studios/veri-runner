@@ -1,0 +1,23 @@
+{
+  "job_id": "job-test",
+  "base_model": "Qwen/Qwen3-4B",
+  "method": "grpo",
+  "hyperparameters": { "learning_rate": 2e-5, "max_steps": 7, "lora_rank": 16 },
+  "output_name": "out",
+  "callback_token": "tok-123",
+  "gpu_type": "H100-80GB",
+  "gpu_count": 1,
+  "provider": "aws",
+  "worker_code_version": "deadbeef",
+  "sandbox_mode": false,
+  "num_nodes": 1,
+  "dataset": { "source_type": "hf", "hf_dataset": "openai/gsm8k" },
+  "dataset_download_url": "https://s3.example/data.jsonl?sig=x",
+  "reward_download_url": "https://s3.example/reward.py?sig=y",
+  "reward_format": "trl",
+  "hf_push": { "repo": "acme/support-bot", "artifact": "adapter", "private": true },
+  "status_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/status",
+  "checkpoint_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/presigned-upload",
+  "log_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/logs/presigned-upload",
+  "hf_credentials_url": "https://api.veri.studio/v1/training_jobs/job-test/hf-credentials"
+}
