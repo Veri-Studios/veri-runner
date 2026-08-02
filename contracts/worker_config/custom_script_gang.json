@@ -1,0 +1,30 @@
+{
+  "job_id": "job-test",
+  "base_model": "Qwen/Qwen3-4B",
+  "method": "grpo",
+  "hyperparameters": {},
+  "output_name": "out",
+  "callback_token": "tok-123",
+  "gpu_type": "A100-80GB",
+  "gpu_count": 8,
+  "provider": "aws",
+  "worker_code_version": "deadbeef",
+  "sandbox_mode": false,
+  "num_nodes": 4,
+  "status_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/status",
+  "checkpoint_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/presigned-upload",
+  "log_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/logs/presigned-upload",
+  "job_type": "custom_script",
+  "script": {
+    "base_image": "veri/base-vllm",
+    "code_artifact_id": "art1",
+    "entrypoint": "torchrun --nproc_per_node=$VERI_NUM_GPUS train.py",
+    "deps": { "kind": "requirements", "content": "trl==0.22.2" },
+    "code_artifact_download_url": "https://s3.example/code.tar.gz?sig=z"
+  },
+  "output_dir": "/workspace/output",
+  "veri_num_nodes": 4,
+  "veri_node_ips": ["10.0.1.7", "10.0.2.3", "10.0.3.9", "10.0.4.5"],
+  "veri_head_ip": "10.0.1.7",
+  "veri_job_id": "job-test"
+}
