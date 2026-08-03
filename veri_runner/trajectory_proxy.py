@@ -21,17 +21,21 @@ Architecture (the Polar / Agent-Lightning pattern):
 
 Anthropic route: /v1/messages is translated by _messages_adapter onto the
 same token-native /chat/ call as the OpenAI route (a verbatim forward 404s:
-TRL's vllm-serve has no /v1/messages route). Requests carrying native
-`tools` get a clear
-400 — tool_use block translation is a follow-up. Spans that come back
-without token ids are marked token_fidelity="absent" and render_episode
-rejects them, so no route can ever poison the training batch.
+TRL's vllm-serve has no /v1/messages route). Native tool_use is translated
+end-to-end (VS-374): the `tools` array rides to the policy chat template in
+OpenAI function format, hermes <tool_call> tags in the decoded completion
+come back as tool_use blocks, tool_result blocks re-render as role:"tool"
+messages, streaming clients get a synthesized Anthropic SSE sequence, and
+/v1/messages/count_tokens is served from the trainer tokenizer. Spans that
+come back without token ids are marked token_fidelity="absent" and
+render_episode rejects them, so no route can ever poison the training batch.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -46,6 +50,144 @@ log = logging.getLogger("veri.trajectory_proxy")
 # OpenAI-compatible endpoints we capture. Everything else (GET /v1/models,
 # /health) is proxied verbatim so harness SDK probes keep working.
 _CAPTURED_POST_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
+
+
+# Hermes-format tool calls (the Qwen-family chat template's native emission):
+# <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def _anthropic_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic tools [{name, description, input_schema}] -> the OpenAI
+    function format chat templates consume (Qwen renders these natively)."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.get("name") or "",
+                "description": t.get("description") or "",
+                "parameters": t.get("input_schema") or {"type": "object"},
+            },
+        }
+        for t in tools
+    ]
+
+
+def _anthropic_messages_to_chat(
+    system: Any, messages: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Anthropic conversation -> OpenAI-style chat messages for the policy
+    chat template. Assistant tool_use blocks become `tool_calls` entries and
+    tool_result blocks become role:"tool" messages, both of which the
+    Qwen-family template renders natively (VS-374). The template owns the
+    canonical serialization — the same path vLLM's chat() takes — so
+    re-rendered history matches the model's own emission as closely as the
+    template allows; residual drift is caught by render_episode's token-exact
+    stitching and last-turn fallback."""
+    out: list[dict[str, Any]] = []
+    if system:
+        out.append({"role": "system", "content": _anthropic_text(system)})
+    for m in messages or []:
+        role = m.get("role") or "user"
+        content = m.get("content")
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        if role == "assistant":
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for b in content or []:
+                if isinstance(b, str):
+                    text_parts.append(b)
+                elif b.get("type") == "text":
+                    text_parts.append(b.get("text") or "")
+                elif b.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": b.get("id") or "",
+                        "type": "function",
+                        "function": {
+                            "name": b.get("name") or "",
+                            "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False),
+                        },
+                    })
+                elif b.get("type") == "thinking":
+                    pass  # never re-render reasoning into the prompt
+                else:
+                    text_parts.append(json.dumps(b, ensure_ascii=False))
+            msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": "\n".join(p for p in text_parts if p),
+            }
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            out.append(msg)
+        else:
+            pending: list[str] = []
+            for b in content or []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    if pending:
+                        out.append({"role": role, "content": "\n".join(pending)})
+                        pending = []
+                    out.append({
+                        "role": "tool",
+                        "content": _anthropic_text(b.get("content")),
+                        "tool_call_id": b.get("tool_use_id") or "",
+                    })
+                elif isinstance(b, str):
+                    pending.append(b)
+                elif b.get("type") == "text":
+                    pending.append(b.get("text") or "")
+                else:
+                    pending.append(json.dumps(b, ensure_ascii=False))
+            if pending:
+                out.append({"role": role, "content": "\n".join(pending)})
+    return out
+
+
+def _parse_tool_calls(
+    text: str, rollout_id: str, index: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """Split a decoded completion into Anthropic content blocks: hermes
+    <tool_call> tags become tool_use blocks, everything else stays text.
+    Malformed tool-call JSON is left visible as text (the harness sees the
+    model's actual output) rather than dropped silently."""
+    plain_parts: list[str] = []
+    tool_uses: list[dict[str, Any]] = []
+    last = 0
+    for i, m in enumerate(_TOOL_CALL_RE.finditer(text)):
+        plain_parts.append(text[last : m.start()])
+        last = m.end()
+        try:
+            call = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            plain_parts.append(m.group(0))
+            continue
+        arguments = call.get("arguments")
+        tool_uses.append({
+            "type": "tool_use",
+            "id": f"toolu_{rollout_id}_{index}_{i}",
+            "name": str(call.get("name") or ""),
+            "input": arguments if isinstance(arguments, dict) else {},
+        })
+    plain_parts.append(text[last:])
+    plain = "".join(plain_parts).strip()
+    content: list[dict[str, Any]] = []
+    if plain or not tool_uses:
+        content.append({"type": "text", "text": plain})
+    content.extend(tool_uses)
+    return content, bool(tool_uses)
+
+
+def _unsupported_block_type(messages: list[dict[str, Any]]) -> str | None:
+    """First content-block type the training route cannot translate (images
+    and documents have no token-native path through /chat/)."""
+    for m in messages or []:
+        content = m.get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") in ("image", "document"):
+                    return b["type"]
+    return None
 
 
 def _anthropic_text(content: Any) -> str:
@@ -434,17 +576,22 @@ class TrajectoryProxy:
                 return None
 
             def _messages_adapter(self, request_json: dict[str, Any], started: float):
-                """Anthropic Messages API -> TRL vllm-serve /chat/.
+                """Anthropic Messages API -> TRL vllm-serve /chat/ (VS-374).
 
-                Supports plain-text Anthropic-SDK harnesses: a verbatim
-                forward 404s (TRL vllm-serve has no /v1/messages route), so
-                translating here rides the same
-                token-native /chat/ call as the OpenAI adapter, so the
-                Anthropic route gets the identical token-fidelity guarantee.
-                Native tool_use is NOT translated yet: requests carrying
-                `tools` get a clear 400 instead of silently degraded rollouts.
+                A verbatim forward 404s (TRL vllm-serve has no /v1/messages
+                route), so this translates onto the same token-native /chat/
+                call as the OpenAI adapter — identical token-fidelity
+                guarantee. Native tool_use rides the policy chat template:
+                the `tools` array converts to OpenAI function format (Qwen
+                templates render it natively), hermes <tool_call> tags in the
+                decoded completion come back as tool_use blocks, and prior
+                tool_use/tool_result turns re-render through the template's
+                own tool_calls / role:"tool" paths. Streaming clients (the
+                Claude Agent SDK) get a synthesized SSE sequence from the
+                buffered response.
                 """
-                if request_json.get("tools"):
+                unsupported = _unsupported_block_type(request_json.get("messages") or [])
+                if unsupported:
                     self._send(
                         400,
                         json.dumps({
@@ -452,25 +599,19 @@ class TrajectoryProxy:
                             "error": {
                                 "type": "invalid_request_error",
                                 "message": (
-                                    "native tool_use is not supported on the "
-                                    "training route yet - use a plain-text "
-                                    "loop (see agent_anthropic.py in the "
-                                    "harness demo) or harness_protocol=openai"
+                                    f"{unsupported} content blocks are not "
+                                    "supported on the training route (no "
+                                    "token-native path through the policy "
+                                    "server); send text and tool blocks only"
                                 ),
                             },
                         }).encode(),
                     )
                     return
 
-                messages: list[dict[str, Any]] = []
-                system = request_json.get("system")
-                if system:
-                    messages.append({"role": "system", "content": _anthropic_text(system)})
-                for m in request_json.get("messages") or []:
-                    messages.append({
-                        "role": m.get("role") or "user",
-                        "content": _anthropic_text(m.get("content")),
-                    })
+                messages = _anthropic_messages_to_chat(
+                    request_json.get("system"), request_json.get("messages") or []
+                )
                 max_tokens = int(request_json.get("max_tokens") or 1024)
                 body = {
                     "messages": [messages],
@@ -480,6 +621,9 @@ class TrajectoryProxy:
                     "max_tokens": max_tokens,
                     "logprobs": 0,  # sampled token's logprob only
                 }
+                tools = request_json.get("tools")
+                if tools:
+                    body["tools"] = _anthropic_tools_to_openai(tools)
                 if proxy.chat_template_kwargs:
                     body["chat_template_kwargs"] = proxy.chat_template_kwargs
                 chat = self._policy_chat(body)
@@ -498,15 +642,24 @@ class TrajectoryProxy:
                 if proxy.tokenizer is not None:
                     text = proxy.tokenizer.decode(completion_ids, skip_special_tokens=True)
                 index = proxy._counters.get(rollout_id, 0)
+                content, has_tool_use = (
+                    _parse_tool_calls(text, rollout_id, index)
+                    if tools
+                    else ([{"type": "text", "text": text}], False)
+                )
+                if has_tool_use:
+                    stop_reason = "tool_use"
+                elif len(completion_ids) >= max_tokens:
+                    stop_reason = "max_tokens"
+                else:
+                    stop_reason = "end_turn"
                 response_json = {
                     "id": f"msg-{rollout_id}-{index}",
                     "type": "message",
                     "role": "assistant",
                     "model": request_json.get("model") or "policy",
-                    "content": [{"type": "text", "text": text}],
-                    "stop_reason": (
-                        "max_tokens" if len(completion_ids) >= max_tokens else "end_turn"
-                    ),
+                    "content": content,
+                    "stop_reason": stop_reason,
                     "stop_sequence": None,
                     "usage": {
                         "input_tokens": len(prompt_ids),
@@ -533,7 +686,115 @@ class TrajectoryProxy:
                         token_fidelity="captured" if prompt_ids and completion_ids else "absent",
                     )
                 )
-                self._send(200, json.dumps(response_json, ensure_ascii=False).encode())
+                if request_json.get("stream"):
+                    self._send_anthropic_sse(response_json)
+                else:
+                    self._send(200, json.dumps(response_json, ensure_ascii=False).encode())
+
+            def _send_anthropic_sse(self, message: dict[str, Any]) -> None:
+                """Synthesize the Anthropic SSE event sequence from a buffered
+                message. Spans can't be reassembled from true streams, so the
+                upstream call is always buffered; streaming clients (the
+                Claude Agent SDK streams by default) still get a
+                protocol-correct event sequence — one delta per block."""
+                start_message = {
+                    **{k: v for k, v in message.items() if k != "content"},
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": message["usage"]["input_tokens"],
+                        "output_tokens": 0,
+                    },
+                }
+                events: list[dict[str, Any]] = [
+                    {"type": "message_start", "message": start_message}
+                ]
+                for i, block in enumerate(message["content"]):
+                    if block["type"] == "tool_use":
+                        events.append({
+                            "type": "content_block_start",
+                            "index": i,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": block["id"],
+                                "name": block["name"],
+                                "input": {},
+                            },
+                        })
+                        events.append({
+                            "type": "content_block_delta",
+                            "index": i,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(
+                                    block["input"], ensure_ascii=False
+                                ),
+                            },
+                        })
+                    else:
+                        events.append({
+                            "type": "content_block_start",
+                            "index": i,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                        events.append({
+                            "type": "content_block_delta",
+                            "index": i,
+                            "delta": {"type": "text_delta", "text": block.get("text") or ""},
+                        })
+                    events.append({"type": "content_block_stop", "index": i})
+                events.append({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": message["stop_reason"],
+                        "stop_sequence": None,
+                    },
+                    "usage": {"output_tokens": message["usage"]["output_tokens"]},
+                })
+                events.append({"type": "message_stop"})
+                payload = b"".join(
+                    f"event: {e['type']}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n".encode()
+                    for e in events
+                )
+                self._send(200, payload, content_type="text/event-stream")
+
+            def _count_tokens_adapter(self, request_json: dict[str, Any]) -> None:
+                """/v1/messages/count_tokens via the trainer tokenizer (the
+                Claude Agent SDK calls this for context management). Not a
+                model call: no span is recorded."""
+                if proxy.tokenizer is None or not hasattr(
+                    proxy.tokenizer, "apply_chat_template"
+                ):
+                    self._send(
+                        501,
+                        json.dumps({
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": "count_tokens unavailable: proxy has no chat-template tokenizer",
+                            },
+                        }).encode(),
+                    )
+                    return
+                try:
+                    messages = _anthropic_messages_to_chat(
+                        request_json.get("system"), request_json.get("messages") or []
+                    )
+                    kwargs: dict[str, Any] = {"add_generation_prompt": True, "tokenize": True}
+                    tools = request_json.get("tools")
+                    if tools:
+                        kwargs["tools"] = _anthropic_tools_to_openai(tools)
+                    ids = proxy.tokenizer.apply_chat_template(messages, **kwargs)
+                    self._send(200, json.dumps({"input_tokens": len(ids)}).encode())
+                except Exception as e:
+                    self._send(
+                        400,
+                        json.dumps({
+                            "type": "error",
+                            "error": {"type": "invalid_request_error", "message": str(e)},
+                        }).encode(),
+                    )
 
             def _chat_adapter(self, request_json: dict[str, Any], started: float):
                 """OpenAI chat.completions -> TRL vllm-serve /chat/.
@@ -625,6 +886,15 @@ class TrajectoryProxy:
                 started = time.time()
                 body_out = raw
                 request_json: dict[str, Any] | None = None
+
+                if raw and self.path == "/v1/messages/count_tokens":
+                    try:
+                        count_request = json.loads(raw)
+                    except json.JSONDecodeError:
+                        count_request = None
+                    if count_request is not None:
+                        self._count_tokens_adapter(count_request)
+                        return
 
                 if not passthrough and raw and self.path == "/v1/chat/completions":
                     try:
