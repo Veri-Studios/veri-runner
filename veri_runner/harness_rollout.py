@@ -25,6 +25,7 @@ holds the callback token and cloud credentials.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -170,12 +171,42 @@ def build_harness_docker_cmd(
     return cmd
 
 
+
+
+_DIRECT_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL")
+
+
+def _direct_inherit_env() -> dict[str, str]:
+    """Minimal worker env a direct-mode harness may inherit (VS-377): enough
+    to find interpreters and write temp files, none of the credential
+    surface (AWS_*, WANDB_*, VERI_* worker internals)."""
+    return {k: os.environ[k] for k in _DIRECT_ENV_ALLOWLIST if k in os.environ}
+
+def _span_history(span: dict[str, Any]) -> list[dict[str, Any]]:
+    """The full conversation as the harness last sent it (protocol-shaped
+    message dicts, OpenAI or Anthropic), plus the final assistant reply -
+    what a shaped reward (VS-378) gets to see via `trajectory=`."""
+    req = span.get("request") or {}
+    out: list[dict[str, Any]] = []
+    if req.get("system"):
+        out.append({"role": "system", "content": req["system"]})
+    out.extend(req.get("messages") or [])
+    resp = span.get("response") or {}
+    if resp.get("choices"):
+        message = resp["choices"][0].get("message") or {}
+        out.append({"role": "assistant", "content": message.get("content")})
+    elif isinstance(resp.get("content"), list):
+        out.append({"role": "assistant", "content": resp["content"]})
+    return out
+
+
 def score_episode(
     reward_fns: list[Callable[..., Any]],
     *,
     task_row: dict[str, Any],
     episode: Episode,
     reward_weights: list[float] | None = None,
+    trajectory: list[dict[str, Any]] | None = None,
 ) -> float:
     """Score a finished trajectory with the uploaded TRL-signature reward
     function(s): reward(prompts=..., completions=..., **extra_columns). The
@@ -190,7 +221,12 @@ def score_episode(
     weights = reward_weights or [1.0] * len(reward_fns)
     total = 0.0
     for fn, weight in zip(reward_fns, weights):
-        value = fn(prompts=prompts, completions=completions, **extra)
+        kwargs = dict(extra)
+        if trajectory is not None and "trajectory" in inspect.signature(fn).parameters:
+            # Shaped rewards (VS-378) opt in by declaring `trajectory`; the
+            # TRL list-per-completion convention holds (one history here).
+            kwargs["trajectory"] = [trajectory]
+        value = fn(prompts=prompts, completions=completions, **kwargs)
         if isinstance(value, (list, tuple)):
             value = value[0] if value else 0.0
         total += weight * float(value)
@@ -300,6 +336,7 @@ class HarnessRunner:
                         task_row=task_row,
                         episode=episode,
                         reward_weights=self.reward_weights,
+                        trajectory=_span_history(spans[-1]) if spans else None,
                     )
                 except TemplateDriftError as e:
                     status, error = "failed", f"template_drift: {e}"
@@ -359,11 +396,13 @@ class HarnessRunner:
         if self.sandbox and self.spec.code_dir:
             cmd = build_harness_docker_cmd(self.spec, env, rollout_id=rollout_id, sandbox=True)
         else:
-            # Direct mode: dev/tests only. Production workers always take the
-            # runsc path above (the worker holds the callback token + cloud
-            # creds; user harness code must not share that process space).
+            # Direct mode: the LIVE path whenever sandbox_mode is off (the
+            # default today - VS-377). The harness must not inherit the
+            # worker's environment (cloud credentials, callback token, W&B
+            # keys), so only a minimal allowlist rides along. Filesystem
+            # isolation still requires the sandbox path.
             cmd = ["bash", "-c", self.spec.entrypoint]
-            env = {**os.environ, **env}
+            env = {**_direct_inherit_env(), **env}
 
         cwd = self.spec.code_dir if not (self.sandbox and self.spec.code_dir) else None
         try:

@@ -68,6 +68,67 @@ def test_score_episode_passes_trl_signature_and_extra_columns():
     assert calls["answer"] == ["yes"]
 
 
+def test_score_episode_passes_trajectory_to_rewards_that_declare_it():
+    # VS-378: shaped rewards opt in via a `trajectory` parameter and receive
+    # the final span's full message history (TRL list-per-completion shape).
+    seen = {}
+
+    def shaped(prompts, completions, trajectory=None, **kwargs):
+        seen["trajectory"] = trajectory
+        return [1.0]
+
+    episode = Episode(
+        rollout_id="r", input_ids=[1], loss_mask=[1], logprobs=[0.0],
+        num_turns=1, final_completion_text="yes",
+    )
+    span = {
+        "request": {"system": "sys", "messages": [{"role": "user", "content": "q"}]},
+        "response": {"content": [{"type": "text", "text": "yes"}]},
+    }
+    from veri_runner.harness_rollout import _span_history
+    score_episode(
+        [shaped], task_row={"prompt": "q"}, episode=episode,
+        trajectory=_span_history(span),
+    )
+    history = seen["trajectory"][0]
+    assert history[0] == {"role": "system", "content": "sys"}
+    assert history[1] == {"role": "user", "content": "q"}
+    assert history[2]["role"] == "assistant"
+
+
+def test_score_episode_never_passes_trajectory_uninvited():
+    # Zero-change contract: a plain TRL reward with NO trajectory param and
+    # NO **kwargs must not receive the kwarg (TypeError would fail the
+    # rollout as reward/render error).
+    def plain(prompts, completions, answer=None):
+        return [1.0]
+
+    episode = Episode(
+        rollout_id="r", input_ids=[1], loss_mask=[1], logprobs=[0.0],
+        num_turns=1, final_completion_text="yes",
+    )
+    value = score_episode(
+        [plain], task_row={"prompt": "q", "answer": "yes"}, episode=episode,
+        trajectory=[{"role": "user", "content": "q"}],
+    )
+    assert value == 1.0
+
+
+def test_direct_mode_env_excludes_worker_credentials(monkeypatch):
+    # VS-377: the direct-mode harness must not inherit the worker's
+    # credential surface, only the interpreter-finding allowlist.
+    from veri_runner.harness_rollout import _direct_inherit_env
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leak-me")
+    monkeypatch.setenv("WANDB_API_KEY", "leak-me-too")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/root")
+    env = _direct_inherit_env()
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "WANDB_API_KEY" not in env
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/root"
+
+
 def test_score_episode_applies_reward_weights():
     episode = Episode(
         rollout_id="r", input_ids=[1], loss_mask=[1], logprobs=[0.0],
