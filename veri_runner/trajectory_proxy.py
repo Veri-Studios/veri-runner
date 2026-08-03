@@ -545,7 +545,12 @@ class TrajectoryProxy:
                 self._proxy(passthrough=True)
 
             def do_POST(self):
-                self._proxy(passthrough=self.path not in _CAPTURED_POST_PATHS)
+                # Claude Code appends query strings (/v1/messages?beta=true);
+                # dispatch on the bare path.
+                self._proxy(passthrough=self.route() not in _CAPTURED_POST_PATHS)
+
+            def route(self) -> str:
+                return self.path.split("?", 1)[0]
 
             def _send(self, status: int, payload: bytes, content_type: str = "application/json"):
                 self.send_response(status)
@@ -675,7 +680,7 @@ class TrajectoryProxy:
                     Span(
                         rollout_id=rollout_id,
                         request_index=index,
-                        path=self.path,
+                        path=self.route(),
                         request=request_json,
                         response=response_json,
                         prompt_token_ids=prompt_ids,
@@ -867,7 +872,7 @@ class TrajectoryProxy:
                     Span(
                         rollout_id=rollout_id,
                         request_index=index,
-                        path=self.path,
+                        path=self.route(),
                         request=request_json,
                         response=response_json,
                         prompt_token_ids=prompt_ids,
@@ -887,7 +892,7 @@ class TrajectoryProxy:
                 body_out = raw
                 request_json: dict[str, Any] | None = None
 
-                if raw and self.path == "/v1/messages/count_tokens":
+                if raw and self.route() == "/v1/messages/count_tokens":
                     try:
                         count_request = json.loads(raw)
                     except json.JSONDecodeError:
@@ -896,7 +901,7 @@ class TrajectoryProxy:
                         self._count_tokens_adapter(count_request)
                         return
 
-                if not passthrough and raw and self.path == "/v1/chat/completions":
+                if not passthrough and raw and self.route() == "/v1/chat/completions":
                     try:
                         chat_request = json.loads(raw)
                     except json.JSONDecodeError:
@@ -905,7 +910,7 @@ class TrajectoryProxy:
                         self._chat_adapter(chat_request, started)
                         return
 
-                if not passthrough and raw and self.path == "/v1/messages":
+                if not passthrough and raw and self.route() == "/v1/messages":
                     try:
                         anthropic_request = json.loads(raw)
                     except json.JSONDecodeError:
@@ -919,7 +924,7 @@ class TrajectoryProxy:
                         request_json = json.loads(raw)
                     except json.JSONDecodeError:
                         request_json = None
-                    if request_json is not None and self.path != "/v1/messages":
+                    if request_json is not None and self.route() != "/v1/messages":
                         # Token-in-token-out capture (Agent Lightning v0.2 /
                         # vLLM >= 0.10.2) + per-token logprobs for GRPO.
                         request_json["return_token_ids"] = True
@@ -971,7 +976,7 @@ class TrajectoryProxy:
                             Span(
                                 rollout_id=rollout_id,
                                 request_index=index,
-                                path=self.path,
+                                path=self.route(),
                                 request=request_json,
                                 response=response_json,
                                 prompt_token_ids=prompt_ids,
