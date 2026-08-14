@@ -16,11 +16,17 @@ Harness contract (documented on the Veri docs site, Training -> Harness):
 - The harness just talks to the endpoint; the proxy captures token ids +
   logprobs below the protocol layer. No tracing library, no code change.
 
-Sandboxing: production rollouts run in docker + gVisor (runsc) with host
-networking (to reach the localhost proxy) and NO GPU (the harness only makes
-HTTP calls; the policy lives on the trainer's GPUs). The direct-subprocess
-mode exists for local dev/tests only — never the default on a worker, which
-holds the callback token and cloud credentials.
+Sandboxing depends on the provider. On runsc-capable AWS hosts, production
+rollouts run in docker + gVisor (runsc) with host networking (to reach the
+localhost proxy) and NO GPU (the harness only makes HTTP calls; the policy
+lives on the trainer's GPUs). On docker-delivery providers (Vast) the worker
+IS a container, so runsc can't nest and sandbox_mode/runsc do not apply: the
+harness runs there as a direct `bash -c <entrypoint>` subprocess in
+production, not just in dev/tests. Because that direct-mode process is not
+isolated from the worker, it must never inherit the worker's environment
+(callback token, cloud credentials, W&B keys), so it gets an explicit minimal
+allowlist env instead of os.environ (see _direct_inherit_env). Filesystem
+isolation still requires the runsc path.
 """
 
 from __future__ import annotations

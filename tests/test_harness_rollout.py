@@ -115,16 +115,34 @@ def test_score_episode_never_passes_trajectory_uninvited():
 
 
 def test_direct_mode_env_excludes_worker_credentials(monkeypatch):
-    # VS-377: the direct-mode harness must not inherit the worker's
-    # credential surface, only the interpreter-finding allowlist.
+    # VS-377: on the docker-delivery (Vast) provider path there is no runsc
+    # nesting, so the harness runs as a direct subprocess in production. It
+    # must NOT inherit the worker's credential surface — cloud keys, the
+    # per-job callback token, W&B keys, or any other VERI_* worker secret —
+    # only the interpreter-finding allowlist rides along.
     from veri_runner.harness_rollout import _direct_inherit_env
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leak-me")
-    monkeypatch.setenv("WANDB_API_KEY", "leak-me-too")
+
+    # Seed the full credential surface a real Vast worker holds in os.environ.
+    secrets = {
+        "AWS_ACCESS_KEY_ID": "leak-me",
+        "AWS_SECRET_ACCESS_KEY": "leak-me",
+        "AWS_SESSION_TOKEN": "leak-me",
+        "VERI_CALLBACK_TOKEN": "leak-me",  # per-job worker callback token
+        "WANDB_API_KEY": "leak-me",
+        "HF_TOKEN": "leak-me",
+    }
+    for k, v in secrets.items():
+        monkeypatch.setenv(k, v)
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("HOME", "/root")
+
     env = _direct_inherit_env()
-    assert "AWS_SECRET_ACCESS_KEY" not in env
-    assert "WANDB_API_KEY" not in env
+
+    # No credential of any kind leaks through the allowlist.
+    for k in secrets:
+        assert k not in env, f"{k} leaked into the direct-mode harness env"
+    assert not any(k.startswith(("AWS_", "WANDB_", "VERI_")) for k in env)
+    # The interpreter-finding allowlist still rides along.
     assert env["PATH"] == "/usr/bin"
     assert env["HOME"] == "/root"
 
