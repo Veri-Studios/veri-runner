@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -399,6 +400,9 @@ def build_grpo_config_kwargs(
     grpo_config_cls: type,
     output_root: str = "/tmp/ckpts",
     wandb_enabled: bool = False,
+    # VS-393: the control plane's computed save policy. None => no
+    # intermediate checkpoints, i.e. exactly pre-VS-393 behaviour.
+    checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build GRPOConfig kwargs while adapting to the installed TRL signature."""
     grpo_params = inspect.signature(grpo_config_cls.__init__).parameters
@@ -415,8 +419,6 @@ def build_grpo_config_kwargs(
         "max_completion_length": hyperparameters.get("max_response_length", 2048),
         "learning_rate": hyperparameters.get("learning_rate", 1e-6),
         "logging_steps": 1,
-        "save_strategy": "no",
-        "save_steps": None,
         "num_train_epochs": 1,
         "report_to": "wandb" if wandb_enabled else "none",
         "bf16": _gpu_supports_bf16(),
@@ -432,6 +434,10 @@ def build_grpo_config_kwargs(
     if "use_vllm" in grpo_params:
         config_kwargs["use_vllm"] = bool(hyperparameters.get("use_vllm", False))
     _apply_liger(config_kwargs, grpo_params, hyperparameters)
+
+    # VS-393: periodic saving, filtered to what the installed TRL accepts
+    # (same drift adaptation as the knobs above).
+    config_kwargs.update(build_save_kwargs(checkpoint, grpo_params))
 
     return config_kwargs
 
@@ -479,6 +485,9 @@ def build_sft_config_kwargs(
     sft_config_cls: type,
     output_root: str = "/tmp/ckpts",
     wandb_enabled: bool = False,
+    # VS-393: the control plane's computed save policy. None => no
+    # intermediate checkpoints, i.e. exactly pre-VS-393 behaviour.
+    checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build SFTConfig kwargs while adapting to the installed TRL signature.
 
@@ -494,7 +503,6 @@ def build_sft_config_kwargs(
         "num_train_epochs": hyperparameters.get("num_epochs", 1),
         "per_device_train_batch_size": hyperparameters.get("batch_size", 1),
         "logging_steps": 1,
-        "save_strategy": "no",
         "report_to": "wandb" if wandb_enabled else "none",
         "bf16": _gpu_supports_bf16(),
         "gradient_checkpointing": True,
@@ -514,6 +522,10 @@ def build_sft_config_kwargs(
             config_kwargs["max_seq_length"] = max_seq
     _apply_liger(config_kwargs, sft_params, hyperparameters)
 
+    # VS-393: periodic saving, filtered to what the installed TRL accepts
+    # (same drift adaptation as the knobs above).
+    config_kwargs.update(build_save_kwargs(checkpoint, sft_params))
+
     return config_kwargs
 
 
@@ -524,6 +536,9 @@ def build_dpo_config_kwargs(
     dpo_config_cls: type,
     output_root: str = "/tmp/ckpts",
     wandb_enabled: bool = False,
+    # VS-393: the control plane's computed save policy. None => no
+    # intermediate checkpoints, i.e. exactly pre-VS-393 behaviour.
+    checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build DPOConfig kwargs while adapting to the installed TRL signature.
 
@@ -540,7 +555,6 @@ def build_dpo_config_kwargs(
         "num_train_epochs": hyperparameters.get("num_epochs", 1),
         "per_device_train_batch_size": hyperparameters.get("batch_size", 1),
         "logging_steps": 1,
-        "save_strategy": "no",
         "report_to": "wandb" if wandb_enabled else "none",
         "bf16": _gpu_supports_bf16(),
         "gradient_checkpointing": True,
@@ -557,6 +571,10 @@ def build_dpo_config_kwargs(
         config_kwargs["max_prompt_length"] = hyperparameters["max_prompt_length"]
     _apply_liger(config_kwargs, dpo_params, hyperparameters)
 
+    # VS-393: periodic saving, filtered to what the installed TRL accepts
+    # (same drift adaptation as the knobs above).
+    config_kwargs.update(build_save_kwargs(checkpoint, dpo_params))
+
     return config_kwargs
 
 
@@ -564,6 +582,45 @@ def checkpoint_output_root(job_config: dict[str, Any]) -> str:
     """Return the runner local output root from structured checkpoint config."""
     checkpoint_config = job_config.get("checkpoint") or {}
     return checkpoint_config.get("local_output_root", "/tmp/ckpts")
+
+
+# Keys of the control plane's `checkpoint` block that map 1:1 onto HF
+# TrainingArguments. The control plane computes the POLICY (VS-393 design 5.3);
+# this only translates and filters it to what the installed TRL accepts.
+_SAVE_KWARG_KEYS = (
+    "save_strategy",
+    "save_steps",
+    "save_total_limit",
+    "save_safetensors",
+    "save_only_model",
+    "ignore_data_skip",
+    "save_on_each_node",
+)
+
+
+def build_save_kwargs(
+    checkpoint: dict[str, Any] | None,
+    config_params: Any = None,
+) -> dict[str, Any]:
+    """Translate the job config's `checkpoint` block into HF save kwargs.
+
+    `None`/absent/disabled all yield `save_strategy="no"`, which is the behaviour
+    every managed job had before VS-393: one artifact, written after train()
+    returns. That default matters -- it is what makes the control plane's feature
+    flag a real kill switch rather than a request the runner may ignore.
+
+    `config_params` is the installed config class's signature parameters (the
+    same signature-adaptation the builders already do for TRL drift); when given,
+    kwargs the installed TRL does not accept are dropped rather than raising.
+    """
+    if not checkpoint or not checkpoint.get("enabled"):
+        return {"save_strategy": "no"}
+
+    kwargs = {k: checkpoint[k] for k in _SAVE_KWARG_KEYS if k in checkpoint}
+    kwargs.setdefault("save_strategy", "steps")
+    if config_params is not None:
+        kwargs = {k: v for k, v in kwargs.items() if k in config_params}
+    return kwargs
 
 
 def save_checkpoint(
@@ -941,6 +998,87 @@ def _attach_progress_callback(
     trainer.add_callback(_ProgressCallback())
 
 
+def _attach_checkpoint_uploader(
+    trainer: Any,
+    job_config: dict[str, Any],
+    upload_fn: Callable[[str, int], None] | None,
+    log: logging.Logger,
+) -> None:
+    """Upload each periodic checkpoint off the training thread (VS-393).
+
+    Registered only when the control plane enabled checkpointing AND the adapter
+    supplied an upload_fn, so with the feature flag dark this is a no-op.
+
+    Three properties, each deliberate:
+
+    * BACKGROUND. A save is 24-40 GB for a full fine-tune; uploading it inline
+      would stall the training loop for minutes per save.
+    * NEWEST-WINS. If step N+1 lands while step N is still uploading, N is
+      abandoned. A queue would let a slow uplink fill a 120 GB root volume, and
+      the newest checkpoint is the only one a resume wants anyway.
+    * DELETE-AFTER-UPLOAD is NOT done here. HF's own save_total_limit owns local
+      rotation; deleting a directory the Trainer still tracks would corrupt its
+      state. Local retention is bounded by save_total_limit=1 instead.
+    """
+    checkpoint_cfg = job_config.get("checkpoint") or {}
+    if not checkpoint_cfg.get("enabled") or not upload_fn:
+        return
+
+    from transformers import TrainerCallback
+
+    class _CheckpointUploadCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self._thread: threading.Thread | None = None
+            # Set to ask an in-flight upload to stop being waited on; the upload
+            # itself is not interruptible, so "abandon" means "stop caring".
+            self._superseded = threading.Event()
+
+        def on_save(self, args, state, control, **kwargs):
+            step = int(getattr(state, "global_step", 0) or 0)
+            ckpt_dir = Path(args.output_dir) / f"checkpoint-{step}"
+            if not ckpt_dir.exists():
+                log.warning("on_save fired but %s is missing; skipping", ckpt_dir)
+                return
+
+            if self._thread is not None and self._thread.is_alive():
+                log.info(
+                    "checkpoint step-%s superseded an in-flight upload; newest wins",
+                    step,
+                )
+                self._superseded.set()
+
+            self._superseded = threading.Event()
+            mine = self._superseded
+
+            def _run():
+                try:
+                    upload_fn(str(ckpt_dir), step)
+                except Exception as e:  # noqa: BLE001
+                    # Never fail the RUN over an upload: the training loop is the
+                    # expensive part and the next save gets another chance. The
+                    # control plane simply has no ready row for this step, which
+                    # is the correct outcome for a failed upload.
+                    if mine.is_set():
+                        log.info("abandoned upload of step-%s: %s", step, e)
+                    else:
+                        log.warning("checkpoint step-%s upload failed: %s", step, e)
+
+            self._thread = threading.Thread(
+                target=_run, name=f"ckpt-upload-{step}", daemon=True
+            )
+            self._thread.start()
+
+        def on_train_end(self, args, state, control, **kwargs):
+            # Give the last upload a bounded chance to finish. Without this the
+            # daemon thread dies at interpreter exit and the most valuable
+            # checkpoint -- the newest -- is the one that goes missing.
+            if self._thread is not None and self._thread.is_alive():
+                log.info("waiting up to 10m for the final checkpoint upload")
+                self._thread.join(timeout=600)
+
+    trainer.add_callback(_CheckpointUploadCallback())
+
+
 def _train_save_finalize(
     *,
     trainer: Any,
@@ -1002,6 +1140,9 @@ def run_grpo_training(
     after_model_load: Callable[[], None] | None = None,
     unsupported_reward_formats: Mapping[str, str] | None = None,
     progress_fn: Callable[[int, int, dict], None] | None = None,
+    # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
+    # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
+    checkpoint_upload_fn: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
     """Run shared GRPO training semantics for a concrete runner adapter."""
     log = logger or logging.getLogger("veri.training_runtime")
@@ -1057,6 +1198,7 @@ def run_grpo_training(
             grpo_config_cls=GRPOConfig,
             output_root=checkpoint_output_root(job_config),
             wandb_enabled=wandb_enabled,
+            checkpoint=job_config.get("checkpoint"),
         )
     )
     trainer = GRPOTrainer(
@@ -1072,6 +1214,7 @@ def run_grpo_training(
     )
 
     _attach_progress_callback(trainer, progress_fn)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
     return _train_save_finalize(
         trainer=trainer,
         tokenizer=tokenizer,
@@ -1315,6 +1458,9 @@ def run_grpo_harness_training(
     harness_code_dir: str | None = None,
     trajectory_sink: Callable[[int, list[Any]], None] | None = None,
     unsupported_reward_formats: Mapping[str, str] | None = None,
+    # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
+    # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
+    checkpoint_upload_fn: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
     """Harness-in-the-loop GRPO: the user's unmodified agent harness
     drives multi-turn rollouts against the in-training policy.
@@ -1509,6 +1655,7 @@ def run_grpo_harness_training(
         grpo_config_cls=GRPOConfig,
         output_root=checkpoint_output_root(job_config),
         wandb_enabled=wandb_enabled,
+        checkpoint=job_config.get("checkpoint"),
     )
     grpo_params = inspect.signature(GRPOConfig.__init__).parameters
     config_kwargs["use_vllm"] = True
@@ -1530,6 +1677,7 @@ def run_grpo_harness_training(
     trainer = GRPOTrainer(**trainer_kwargs)
 
     _attach_progress_callback(trainer, progress_fn)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
     try:
         return _train_save_finalize(
             trainer=trainer,
@@ -1580,6 +1728,9 @@ def run_sft_text_training(
     logger: logging.Logger | None = None,
     after_model_load: Callable[[], None] | None = None,
     progress_fn: Callable[[int, int, dict], None] | None = None,
+    # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
+    # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
+    checkpoint_upload_fn: Callable[[str, int], None] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Supervised fine-tuning on text via TRL SFTTrainer.
@@ -1640,6 +1791,7 @@ def run_sft_text_training(
             sft_config_cls=SFTConfig,
             output_root=checkpoint_output_root(job_config),
             wandb_enabled=wandb_enabled,
+            checkpoint=job_config.get("checkpoint"),
         )
     )
     trainer = SFTTrainer(
@@ -1653,6 +1805,7 @@ def run_sft_text_training(
     )
 
     _attach_progress_callback(trainer, progress_fn)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
     return _train_save_finalize(
         trainer=trainer,
         tokenizer=tokenizer,
@@ -1691,6 +1844,9 @@ def run_dpo_training(
     logger: logging.Logger | None = None,
     after_model_load: Callable[[], None] | None = None,
     progress_fn: Callable[[int, int, dict], None] | None = None,
+    # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
+    # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
+    checkpoint_upload_fn: Callable[[str, int], None] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Direct Preference Optimization via TRL DPOTrainer.
@@ -1742,6 +1898,7 @@ def run_dpo_training(
             dpo_config_cls=DPOConfig,
             output_root=checkpoint_output_root(job_config),
             wandb_enabled=wandb_enabled,
+            checkpoint=job_config.get("checkpoint"),
         )
     )
     trainer = DPOTrainer(
@@ -1755,6 +1912,7 @@ def run_dpo_training(
     )
 
     _attach_progress_callback(trainer, progress_fn)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
     return _train_save_finalize(
         trainer=trainer,
         tokenizer=tokenizer,

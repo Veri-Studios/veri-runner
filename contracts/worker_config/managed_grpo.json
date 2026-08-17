@@ -3,6 +3,7 @@
   "base_model": "Qwen/Qwen3-4B",
   "method": "grpo",
   "hyperparameters": { "learning_rate": 2e-5, "max_steps": 7 },
+  "checkpoint": { "enabled": false, "save_strategy": "no" },
   "output_name": "out",
   "callback_token": "tok-123",
   "gpu_type": "H100-80GB",
@@ -17,5 +18,6 @@
   "reward_format": "trl",
   "status_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/status",
   "checkpoint_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/presigned-upload",
-  "log_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/logs/presigned-upload"
+  "log_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/logs/presigned-upload",
+  "checkpoint_step_base_url": "https://api.veri.studio/v1/training_jobs/job-test/checkpoints"
 }

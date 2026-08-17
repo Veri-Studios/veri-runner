@@ -3,6 +3,7 @@
   "base_model": "Qwen/Qwen3-4B",
   "method": "grpo",
   "hyperparameters": {},
+  "checkpoint": { "enabled": false, "save_strategy": "no" },
   "output_name": "out",
   "callback_token": "tok-123",
   "gpu_type": "A100-80GB",
@@ -14,6 +15,7 @@
   "status_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/status",
   "checkpoint_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/presigned-upload",
   "log_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/logs/presigned-upload",
+  "checkpoint_step_base_url": "https://api.veri.studio/v1/training_jobs/job-test/checkpoints",
   "job_type": "custom_script",
   "script": {
     "base_image": "veri/base-vllm",
