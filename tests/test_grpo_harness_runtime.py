@@ -6,6 +6,7 @@ from __future__ import annotations
 from veri_runner.harness_rollout import RolloutResult
 from veri_runner.training_runtime import (
     _policy_server_devices,
+    _policy_server_layout,
     build_rollout_batch,
     harness_reward_adapter,
     validate_rows_for_method,
@@ -86,6 +87,44 @@ def test_policy_server_devices_clamps_tp_to_power_of_two():
         devices = _policy_server_devices(n)
         assert 0 not in devices
         assert len(devices) & (len(devices) - 1) == 0
+
+
+def test_policy_server_layout_defaults_match_the_clamp():
+    # No knobs set -> byte-for-byte the safe clamp, DP=1. This is the
+    # non-breaking guarantee: existing configs launch the identical command.
+    for n in range(2, 9):
+        devices, tp, dp = _policy_server_layout(n, {})
+        assert devices == _policy_server_devices(n)
+        assert (tp, dp) == (len(devices), 1)
+
+
+def test_policy_server_layout_knobs():
+    import pytest
+
+    # DP only: TP snaps to the largest power of two fitting available // DP.
+    # L4 x4 + dp=3 is the zero-idle layout for small models.
+    assert _policy_server_layout(4, {"vllm_data_parallel_size": 3}) == ([1, 2, 3], 1, 3)
+    assert _policy_server_layout(8, {"vllm_data_parallel_size": 7}) == (
+        [1, 2, 3, 4, 5, 6, 7], 1, 7,
+    )
+    # Both set: used verbatim (vLLM still enforces head divisibility at boot).
+    assert _policy_server_layout(
+        8, {"vllm_tensor_parallel_size": 2, "vllm_data_parallel_size": 3}
+    ) == ([1, 2, 3, 4, 5, 6], 2, 3)
+    # TP only: DP stays 1.
+    assert _policy_server_layout(8, {"vllm_tensor_parallel_size": 4}) == (
+        [1, 2, 3, 4], 4, 1,
+    )
+    # Over-subscription and non-positive values are rejected, not clamped:
+    # silently shrinking an explicit request would hide a misconfiguration.
+    for bad in [
+        {"vllm_tensor_parallel_size": 4, "vllm_data_parallel_size": 2},  # 8 > 7
+        {"vllm_data_parallel_size": 8},  # > gpu_count-1
+        {"vllm_data_parallel_size": 0},
+        {"vllm_tensor_parallel_size": 0},
+    ]:
+        with pytest.raises(ValueError):
+            _policy_server_layout(8, bad)
 
 
 def test_harness_reward_adapter_forwards_scores():

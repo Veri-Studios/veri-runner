@@ -1121,12 +1121,62 @@ def _policy_server_devices(gpu_count: int) -> list[int]:
     return list(range(1, 1 + tp))
 
 
+def _policy_server_layout(
+    gpu_count: int, hyperparameters: dict[str, Any]
+) -> tuple[list[int], int, int]:
+    """Resolve (devices, tensor_parallel, data_parallel) for the policy server.
+
+    User knobs (both optional, validated at submit and re-checked here):
+      vllm_tensor_parallel_size  explicit TP; passed to vLLM verbatim (vLLM
+                                 enforces head-count divisibility at boot)
+      vllm_data_parallel_size    replica count; TRL vllm-serve chunks requests
+                                 across replicas and weight-syncs all of them
+                                 (world size = TP*DP + trainer)
+
+    Resolution: both set -> use as-is; DP only -> TP = largest power of two
+    that fits available // DP; TP only -> DP = 1; neither -> the safe clamp
+    (_policy_server_devices), byte-for-byte the pre-knob behavior. The server
+    owns GPUs 1..TP*DP; DP is how idle GPUs on x4/x8 shapes get reclaimed
+    (e.g. L4 x4 + dp=3 -> TP=1 x DP=3, zero idle).
+    """
+    available = gpu_count - 1
+    tp_raw = hyperparameters.get("vllm_tensor_parallel_size")
+    dp_raw = hyperparameters.get("vllm_data_parallel_size")
+    if tp_raw is None and dp_raw is None:
+        devices = _policy_server_devices(gpu_count)
+        return devices, len(devices), 1
+
+    dp = int(dp_raw) if dp_raw is not None else 1
+    if dp < 1 or dp > available:
+        raise ValueError(
+            f"vllm_data_parallel_size must be in 1..{available} "
+            f"(gpu_count-1; GPU 0 is the trainer's), got {dp}"
+        )
+    if tp_raw is not None:
+        tp = int(tp_raw)
+        if tp < 1:
+            raise ValueError(f"vllm_tensor_parallel_size must be >= 1, got {tp}")
+    else:
+        tp = 1
+        while tp * 2 <= available // dp:
+            tp *= 2
+    if tp * dp > available:
+        raise ValueError(
+            f"vllm_tensor_parallel_size * vllm_data_parallel_size = {tp}*{dp} "
+            f"exceeds the {available} GPUs available to the policy server "
+            f"(gpu_count-1; GPU 0 is the trainer's)"
+        )
+    return list(range(1, 1 + tp * dp)), tp, dp
+
+
 def _launch_policy_server(
     *,
     base_model: str,
     devices: list[int],
     hyperparameters: dict[str, Any],
     log: logging.Logger,
+    tensor_parallel_size: int | None = None,
+    data_parallel_size: int = 1,
 ) -> tuple[Any, str]:
     """Start TRL's vllm-serve as the policy server and return (proc, base_url).
 
@@ -1161,13 +1211,19 @@ def _launch_policy_server(
         "--model", base_model,
         "--host", "127.0.0.1",
         "--port", str(port),
-        "--tensor_parallel_size", str(len(devices)),
+        "--tensor_parallel_size",
+        str(tensor_parallel_size if tensor_parallel_size is not None else len(devices)),
         # The server owns its devices outright (device split), so vLLM can
         # take most of the card; 0.85 leaves room for the CUDA context and
         # NCCL buffers. Overridable via vllm_gpu_memory_utilization.
         "--gpu_memory_utilization",
         str(hyperparameters.get("vllm_gpu_memory_utilization", 0.85)),
     ]
+    # Only emitted when >1 so the default command stays byte-identical to the
+    # pre-DP launch. TRL chunks /chat/ requests across replicas and includes
+    # every replica in the weight-sync group (world = TP*DP + trainer).
+    if data_parallel_size > 1:
+        cmd += ["--data_parallel_size", str(data_parallel_size)]
     if hyperparameters.get("max_model_len"):
         cmd += ["--max_model_len", str(hyperparameters["max_model_len"])]
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(str(d) for d in devices)}
@@ -1346,15 +1402,18 @@ def run_grpo_harness_training(
     # model load below is the first user; the server subprocess gets its own
     # explicit CUDA_VISIBLE_DEVICES from _launch_policy_server.
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    server_devices = _policy_server_devices(gpu_count)
+    server_devices, server_tp, server_dp = _policy_server_layout(
+        gpu_count, hyperparameters
+    )
     if len(server_devices) < gpu_count - 1:
         log.warning(
-            "policy server takes %d of %d non-trainer GPUs (TP must divide the "
-            "model's attention heads; largest power of two <= %d is %d); GPUs %s idle",
+            "policy server takes %d of %d non-trainer GPUs (TP=%d x DP=%d; TP must "
+            "divide the model's attention heads); GPUs %s idle — reclaim them with "
+            "vllm_data_parallel_size / vllm_tensor_parallel_size",
             len(server_devices),
             gpu_count - 1,
-            gpu_count - 1,
-            len(server_devices),
+            server_tp,
+            server_dp,
             list(range(1 + len(server_devices), gpu_count)),
         )
     server_proc, policy_url = _launch_policy_server(
@@ -1362,6 +1421,8 @@ def run_grpo_harness_training(
         devices=server_devices,
         hyperparameters=hyperparameters,
         log=log,
+        tensor_parallel_size=server_tp,
+        data_parallel_size=server_dp,
     )
     # Model + tokenizer load before the proxy: the proxy decodes completion
     # ids into the OpenAI-shaped response text (TRL's /chat/ returns ids only).
