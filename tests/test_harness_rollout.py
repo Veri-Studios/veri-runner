@@ -4,15 +4,18 @@ rollout through the trajectory proxy in direct (non-sandbox) mode."""
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
 from veri_runner.harness_rollout import (
     HarnessRunner,
     HarnessSpec,
+    _harness_inner_script,
     build_harness_env,
     score_episode,
 )
@@ -145,6 +148,125 @@ def test_direct_mode_env_excludes_worker_credentials(monkeypatch):
     # The interpreter-finding allowlist still rides along.
     assert env["PATH"] == "/usr/bin"
     assert env["HOME"] == "/root"
+
+
+# ---- direct-mode dependency installation (VS-377 residual) ------------------
+
+# A requirements file with no packages: the installer really runs (uv, or the
+# python -m pip fallback) and really succeeds, with no network and no wheel
+# build, so these tests exercise the true install path deterministically.
+_NO_OP_REQUIREMENTS = "# harness deps: nothing to install\n"
+_BAD_REQUIREMENTS = "this is not === a valid requirement\n"
+
+# Reports what the harness subprocess actually got: its own sys.prefix (the
+# venv only counts if `python3` off PATH resolves inside it), VIRTUAL_ENV, and
+# PATH.
+_ENV_PROBE = (
+    "import json, os, sys; "
+    "open(os.environ['PROBE_OUT'], 'w').write(json.dumps({"
+    "'prefix': os.path.realpath(sys.prefix), "
+    "'virtual_env': os.environ.get('VIRTUAL_ENV'), "
+    "'path': os.environ.get('PATH')}))"
+)
+
+
+def _dep_runner(tmp_path, *, deps=None, sandbox=False, code_dir=None,
+                entrypoint="true", spec_env=None):
+    """A runner built only to observe dep handling. `proxy` is never touched:
+    these tests drive _exec_harness directly, no policy server needed."""
+    spec = HarnessSpec(
+        entrypoint=entrypoint,
+        code_dir=code_dir,
+        deps=deps or {},
+        env=spec_env or {},
+    )
+    return HarnessRunner(
+        spec=spec,
+        proxy=None,
+        span_store=SpanStore(tmp_path / "spans"),
+        reward_fns=[],
+        trajectory_dir=str(tmp_path / "trajectories"),
+        sandbox=sandbox,
+        timeout_s=120,
+    )
+
+
+def _run_probe(runner, out):
+    status, error = runner._exec_harness(
+        rollout_id="s0-t0-r0",
+        base_url="http://127.0.0.1:1/v1",  # never dialed: the probe makes no calls
+        task_row={"prompt": "x"},
+        task_index=0,
+        rollout_index=0,
+    )
+    assert status == "completed", error
+    return json.loads(Path(out).read_text())
+
+
+def test_direct_mode_installs_declared_deps_and_exports_venv(tmp_path):
+    # VS-377 residual: direct mode (every Vast rollout, and any AWS run with
+    # sandbox_mode off) has no container to layer deps into, so the runner
+    # builds an overlay venv at construction and every rollout runs inside it.
+    out = tmp_path / "probe.json"
+    runner = _dep_runner(
+        tmp_path,
+        deps={"kind": "requirements", "content": _NO_OP_REQUIREMENTS},
+        entrypoint=f'python3 -c "{_ENV_PROBE}"',
+        spec_env={"PROBE_OUT": str(out)},
+    )
+
+    venv = runner._dep_env["VIRTUAL_ENV"]
+    assert Path(venv, "bin", "python3").exists()
+    assert runner._dep_env["PATH"].startswith(f"{Path(venv, 'bin')}:")
+
+    probe = _run_probe(runner, out)
+    # The subprocess env carries the overlay AND `python3` resolves into it,
+    # which is what makes a harness's own pins importable.
+    assert probe["virtual_env"] == venv
+    assert probe["prefix"] == os.path.realpath(venv)
+
+
+def test_direct_mode_without_deps_builds_no_venv_and_leaves_env_untouched(tmp_path):
+    # The BAD-case twin: a harness that declares nothing must pay no venv and
+    # see exactly the inherited allowlist PATH (no phantom overlay prepended).
+    out = tmp_path / "probe.json"
+    runner = _dep_runner(
+        tmp_path,
+        deps={},
+        entrypoint=f'python3 -c "{_ENV_PROBE}"',
+        spec_env={"PROBE_OUT": str(out)},
+    )
+
+    assert runner._dep_env == {}
+
+    probe = _run_probe(runner, out)
+    assert probe["virtual_env"] is None
+    assert probe["path"] == os.environ["PATH"]
+
+
+def test_direct_mode_dep_install_failure_raises_before_any_rollout(tmp_path):
+    # Deps that cannot install kill the job at step 0 with the installer's own
+    # error, rather than N rollouts of confusing ModuleNotFoundError.
+    with pytest.raises(RuntimeError, match="harness deps install failed"):
+        _dep_runner(
+            tmp_path,
+            deps={"kind": "requirements", "content": _BAD_REQUIREMENTS},
+        )
+
+
+def test_docker_mode_installs_deps_in_the_container_not_a_host_venv(tmp_path):
+    # Mode twin: with a sandbox + code bundle the deps belong INSIDE the
+    # rollout container, so no host venv is built for them.
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    runner = _dep_runner(
+        tmp_path,
+        deps={"kind": "requirements", "content": _NO_OP_REQUIREMENTS},
+        sandbox=True,
+        code_dir=str(code_dir),
+    )
+    assert runner._dep_env == {}
+    assert "uv pip install --system -r" in _harness_inner_script(runner.spec)
 
 
 def test_score_episode_applies_reward_weights():

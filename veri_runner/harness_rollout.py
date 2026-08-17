@@ -188,6 +188,76 @@ def _direct_inherit_env() -> dict[str, str]:
     surface (AWS_*, WANDB_*, VERI_* worker internals)."""
     return {k: os.environ[k] for k in _DIRECT_ENV_ALLOWLIST if k in os.environ}
 
+
+def prepare_direct_deps(spec: HarnessSpec, log: logging.Logger) -> dict[str, str]:
+    """Install the harness's --requirements/--uv-lock deps for DIRECT mode.
+
+    The docker path layers deps inside the rollout container
+    (_harness_inner_script). Direct mode has no container, so HarnessRunner
+    calls this ONCE at construction and merges the returned env into every
+    rollout's harness env. Before that wiring (the VS-377 residual) direct
+    mode ignored declared deps silently, so a harness that imported a package
+    from its own requirements died with a bare ModuleNotFoundError
+    mid-rollout.
+
+    Deps go into an overlay venv built with --system-site-packages on top of
+    the worker's interpreter: the harness sees the worker image's packages
+    (anthropic, claude-agent-sdk, ...) PLUS its own pins, and the worker's
+    environment is never mutated (a user pinning transformers cannot break
+    the trainer). Returns the env overrides (PATH, VIRTUAL_ENV) for harness
+    subprocesses; {} when there is nothing to install.
+
+    Failures RAISE: a job whose declared deps cannot install should die at
+    step 0 with the pip error, not run N rollouts of confusing import
+    failures.
+    """
+    deps = spec.deps or {}
+    kind = deps.get("kind", "none")
+    content = deps.get("content")
+    if kind not in ("requirements", "uv_lock") or not content:
+        return {}
+
+    import sys
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="veri-harness-deps-"))
+    venv = root / "venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    spec_file = root / ("requirements.txt" if kind == "requirements" else "uv.lock")
+    spec_file.write_text(content)
+    python = str(venv / "bin" / "python")
+    if kind == "requirements":
+        cmd = ["uv", "pip", "install", "--python", python, "-r", str(spec_file)]
+        fallback = [python, "-m", "pip", "install", "-r", str(spec_file)]
+    else:
+        cmd = ["uv", "pip", "sync", "--python", python, str(spec_file)]
+        fallback = None  # uv.lock has no pip equivalent
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        # No uv on this host (direct mode also runs on AWS with the flag off).
+        if fallback is None:
+            raise RuntimeError(
+                "harness deps: uv is required to install a uv.lock in direct "
+                "mode and is not on PATH"
+            ) from None
+        proc = subprocess.run(fallback, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "harness deps install failed (direct mode): "
+            + (proc.stderr or proc.stdout or "")[-2000:]
+        )
+    log.info("direct-mode harness deps installed into %s", venv)
+    return {
+        "PATH": f"{venv / 'bin'}:{os.environ.get('PATH', '')}",
+        "VIRTUAL_ENV": str(venv),
+    }
+
 def _span_history(span: dict[str, Any]) -> list[dict[str, Any]]:
     """The full conversation as the harness last sent it (protocol-shaped
     message dicts, OpenAI or Anthropic), plus the final assistant reply -
@@ -270,6 +340,14 @@ class HarnessRunner:
         self.timeout_s = timeout_s
         self.max_parallel = max_parallel
         self._sem = threading.Semaphore(max_parallel)
+        # Direct mode has no container to layer the harness's declared deps
+        # into, so install them here: once per runner, not once per rollout,
+        # and before any rollout runs (a bad pin dies at step 0). The docker
+        # branch installs inside the container instead, so it skips this. The
+        # condition mirrors the sandbox branch in _exec_harness.
+        self._dep_env: dict[str, str] = (
+            {} if (sandbox and spec.code_dir) else prepare_direct_deps(spec, log)
+        )
 
     def run_step(
         self,
@@ -407,8 +485,10 @@ class HarnessRunner:
             # worker's environment (cloud credentials, callback token, W&B
             # keys), so only a minimal allowlist rides along. Filesystem
             # isolation still requires the sandbox path.
+            # _dep_env last: its PATH/VIRTUAL_ENV must win over the inherited
+            # PATH, or the overlay venv installed at construction is invisible.
             cmd = ["bash", "-c", self.spec.entrypoint]
-            env = {**_direct_inherit_env(), **env}
+            env = {**_direct_inherit_env(), **env, **self._dep_env}
 
         cwd = self.spec.code_dir if not (self.sandbox and self.spec.code_dir) else None
         try:
