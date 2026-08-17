@@ -1103,6 +1103,24 @@ def _wait_for_policy_server(base_url: str, proc: Any, timeout_s: int = 1800) -> 
     raise RuntimeError(f"policy server did not become healthy within {timeout_s}s")
 
 
+def _policy_server_devices(gpu_count: int) -> list[int]:
+    """CUDA ordinals the policy server owns: GPUs 1..n-1, clamped so TP is legal.
+
+    vLLM requires num_attention_heads % tensor_parallel_size == 0, and TP here
+    is exactly len(devices). gpu_count-1 is often illegal (4 GPUs -> TP=3,
+    8 -> TP=7; 32-head models like Qwen3 divide by neither), which made every
+    aws harness shape crash at vLLM boot (VS-374 blocker 1). Clamp to the
+    largest power of two <= gpu_count-1: head counts are in practice divisible
+    by small powers of two (32, 28, 40 heads all divide by 4), so odd counts
+    degrade to idle GPUs instead of a dead job.
+    """
+    available = gpu_count - 1
+    tp = 1
+    while tp * 2 <= available:
+        tp *= 2
+    return list(range(1, 1 + tp))
+
+
 def _launch_policy_server(
     *,
     base_model: str,
@@ -1321,14 +1339,27 @@ def run_grpo_harness_training(
             "H100-80GB x2 (vast)."
         )
     # Device split (forced by the TRL guard above): the
-    # trainer takes GPU 0, the policy server takes GPUs 1..n-1 (TP = n-1).
+    # trainer takes GPU 0, the policy server takes GPUs 1..TP where TP is the
+    # largest power of two <= n-1 (see _policy_server_devices); any remainder
+    # idles rather than crashing vLLM on an illegal tensor_parallel_size.
     # The trainer pin must land before this process first touches CUDA —
     # model load below is the first user; the server subprocess gets its own
     # explicit CUDA_VISIBLE_DEVICES from _launch_policy_server.
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    server_devices = _policy_server_devices(gpu_count)
+    if len(server_devices) < gpu_count - 1:
+        log.warning(
+            "policy server takes %d of %d non-trainer GPUs (TP must divide the "
+            "model's attention heads; largest power of two <= %d is %d); GPUs %s idle",
+            len(server_devices),
+            gpu_count - 1,
+            gpu_count - 1,
+            len(server_devices),
+            list(range(1 + len(server_devices), gpu_count)),
+        )
     server_proc, policy_url = _launch_policy_server(
         base_model=base_model,
-        devices=list(range(1, gpu_count)),
+        devices=server_devices,
         hyperparameters=hyperparameters,
         log=log,
     )

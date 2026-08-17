@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from veri_runner.harness_rollout import RolloutResult
 from veri_runner.training_runtime import (
+    _policy_server_devices,
     build_rollout_batch,
     harness_reward_adapter,
     validate_rows_for_method,
@@ -67,6 +68,24 @@ def test_build_rollout_batch_failed_rollout_is_zero_mask_sentinel():
     assert len(batch["prompt_ids"]) == 2
     assert batch["env_mask"][1] == [0]
     assert batch["harness_reward"][1] == 0.0
+
+
+def test_policy_server_devices_clamps_tp_to_power_of_two():
+    # VS-374 blocker 1: TP = gpu_count-1 was illegal on every aws shape
+    # (vLLM needs num_attention_heads % TP == 0; 32-head models divide by
+    # neither 3 nor 7). TP must now be the largest power of two <= n-1, with
+    # the trainer keeping GPU 0 and any remainder idling instead of crashing.
+    assert _policy_server_devices(2) == [1]            # vast x2: TP=1
+    assert _policy_server_devices(3) == [1, 2]         # TP=2
+    assert _policy_server_devices(4) == [1, 2]         # aws x4: TP=2, GPU 3 idle
+    assert _policy_server_devices(5) == [1, 2, 3, 4]   # TP=4
+    assert _policy_server_devices(8) == [1, 2, 3, 4]   # aws x8: TP=4, GPUs 5-7 idle
+    # Every returned length is a power of two (a legal divisor of any
+    # power-of-two-divisible head count) and excludes the trainer's GPU 0.
+    for n in range(2, 9):
+        devices = _policy_server_devices(n)
+        assert 0 not in devices
+        assert len(devices) & (len(devices) - 1) == 0
 
 
 def test_harness_reward_adapter_forwards_scores():
