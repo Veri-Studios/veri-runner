@@ -413,7 +413,10 @@ def test_proxy_anthropic_image_blocks_rejected_clearly(upstream, tmp_path):
                     "model": "stub",
                     "max_tokens": 64,
                     "messages": [{"role": "user", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}},
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": "x"},
+                        },
                     ]}],
                 },
             )

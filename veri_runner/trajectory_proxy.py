@@ -777,7 +777,10 @@ class TrajectoryProxy:
                             "type": "error",
                             "error": {
                                 "type": "api_error",
-                                "message": "count_tokens unavailable: proxy has no chat-template tokenizer",
+                                "message": (
+                                    "count_tokens unavailable: "
+                                    "proxy has no chat-template tokenizer"
+                                ),
                             },
                         }).encode(),
                     )
