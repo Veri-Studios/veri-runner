@@ -671,6 +671,90 @@ def test_use_liger_without_package_fails_fast_before_dispatch(monkeypatch):
     assert out == {"ok": True} and called["dispatched"]
 
 
+# ---- use_liger compatibility guards (mirror of the control plane's submit check) ----
+
+
+def _liger_dispatch_spy(monkeypatch):
+    """Stub every managed dispatch arm on a box that HAS liger-kernel, so the
+    only thing between run_training and dispatch is the compatibility guard."""
+    called = {}
+
+    def fake_arm(job_config, **kw):
+        called["dispatched"] = job_config["method"]
+        return {"ok": True}
+
+    for arm in ("run_grpo_training", "run_grpo_harness_training",
+                "run_sft_text_training", "run_dpo_training"):
+        monkeypatch.setattr(f"veri_runner.training_runtime.{arm}", fake_arm)
+    monkeypatch.setattr("veri_runner.training_runtime._is_rocm", lambda: False)
+    monkeypatch.setattr("veri_runner.training_runtime._liger_available", lambda: True)
+    return called
+
+
+@pytest.mark.parametrize(
+    "method, gpu_count, hp, needle",
+    [
+        # (a) model split across GPUs: liger's RoPE kernel crashes on the
+        # device_map="auto" shards ("Pointer argument cannot be accessed").
+        ("sft_text", 2, {}, "gpu_count 2"),
+        ("dpo", 4, {}, "gpu_count 4"),
+        ("grpo", 8, {}, "gpu_count 8"),
+        # (d) both patch the same model modules; never validated together.
+        ("sft_text", 1, {"use_unsloth": True}, "use_unsloth"),
+        # (b) TRL 1.7.1 raises NotImplementedError for liger DPO on PEFT models.
+        ("dpo", 1, {"lora_rank": 16}, "full fine-tunes only"),
+        ("dpo", 1, {"lora_rank": 16, "load_in_4bit": True}, "full fine-tunes only"),
+        ("dpo", 1, {"load_in_4bit": True}, "full fine-tunes only"),
+        # (c) loss types liger's fused DPO loss does not implement (ValueError at init).
+        ("dpo", 1, {"loss_type": "ipo"}, "loss_type 'ipo'"),
+        ("dpo", 1, {"loss_type": "aot"}, "loss_type 'aot'"),
+        ("dpo", 1, {"loss_type": "aot_unpaired"}, "loss_type 'aot_unpaired'"),
+        ("dpo", 1, {"loss_type": "sft"}, "loss_type 'sft'"),
+        ("dpo", 1, {"loss_type": "sigmoid_norm"}, "loss_type 'sigmoid_norm'"),
+    ],
+)
+def test_use_liger_incompatible_config_fails_before_dispatch(
+    monkeypatch, method, gpu_count, hp, needle
+):
+    # BAD it guards: each of these crashes on the GPU (or at trainer init, after
+    # the model download) with liger on. It must fail with the reason first.
+    called = _liger_dispatch_spy(monkeypatch)
+    with pytest.raises(ValueError, match="use_liger") as exc:
+        run_training(
+            {"method": method, "job_id": "j", "base_model": "m", "gpu_count": gpu_count,
+             "hyperparameters": {"use_liger": True, **hp}},
+            dataset_path="/data",
+        )
+    assert needle in str(exc.value)
+    assert "dispatched" not in called
+
+
+@pytest.mark.parametrize(
+    "method, gpu_count, hp",
+    [
+        # GOOD: the configs liger was benchmarked on still dispatch.
+        ("sft_text", 1, {"use_liger": True}),
+        ("sft_text", 1, {"use_liger": True, "lora_rank": 16, "load_in_4bit": True}),
+        ("grpo", 1, {"use_liger": True, "lora_rank": 16}),
+        ("dpo", 1, {"use_liger": True}),
+        ("dpo", 1, {"use_liger": True, "loss_type": "hinge"}),
+        # gpu_count absent from the config means one GPU (worker default).
+        ("sft_text", None, {"use_liger": True}),
+        # GOOD: the guard is scoped to use_liger; without it nothing changes.
+        ("sft_text", 8, {}),
+        ("dpo", 1, {"lora_rank": 16, "loss_type": "ipo"}),
+        ("sft_text", 1, {"use_liger": False, "use_unsloth": True}),
+    ],
+)
+def test_use_liger_compatible_config_dispatches(monkeypatch, method, gpu_count, hp):
+    called = _liger_dispatch_spy(monkeypatch)
+    job = {"method": method, "job_id": "j", "base_model": "m", "hyperparameters": hp}
+    if gpu_count is not None:
+        job["gpu_count"] = gpu_count
+    assert run_training(job, dataset_path="/data") == {"ok": True}
+    assert called["dispatched"] == method
+
+
 def test_tunableop_is_opt_in(monkeypatch):
     # TunableOp tunes at runtime (costly on variable shapes), so it must only
     # engage when the hyperparameter asks for it.

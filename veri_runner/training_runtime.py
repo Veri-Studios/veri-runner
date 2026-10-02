@@ -1932,10 +1932,57 @@ def _is_rocm() -> bool:
 
 
 def _liger_available() -> bool:
-    """True when liger-kernel is importable (installed by the ROCm bootstrap;
-    NOT guaranteed on other images)."""
+    """True when liger-kernel is importable. It is installed on the AWS worker
+    AMI, the Vast and GCP worker images and by the ROCm bootstrap; images built
+    before it was added lack it."""
     import importlib.util
     return importlib.util.find_spec("liger_kernel") is not None
+
+
+# DPO loss types liger-kernel 0.8.4's fused DPO loss implements
+# (LigerFusedLinearDPOLoss._SUPPORTED_LOSS_TYPES). TRL 1.7.1's other loss types
+# (ipo, aot, aot_unpaired, sft, sigmoid_norm) raise at trainer init with liger on.
+LIGER_DPO_LOSS_TYPES = (
+    "sigmoid", "hinge", "exo_pair", "nca_pair", "robust",
+    "bco_pair", "sppo_hard", "apo_zero", "apo_down", "discopop",
+)
+
+
+def liger_incompatibility(
+    method: str, gpu_count: int, hyperparameters: dict[str, Any]
+) -> str | None:
+    """Why use_liger cannot run with this job, or None when it can.
+
+    Each rejected combination crashes on the GPU or at trainer init on the
+    worker stack (torch 2.9.1, trl 1.7.1, liger-kernel 0.8.4). The control
+    plane rejects the same set at submit (validate_liger in
+    control_plane_new/src/api/training_jobs.rs); keep the two in sync."""
+    if gpu_count > 1:
+        return (
+            f"use_liger is supported on single-GPU jobs only (got gpu_count {gpu_count}): "
+            "liger-kernel's Triton kernels fail when the model is split across GPUs. "
+            "Use gpu_count 1 or drop use_liger."
+        )
+    if hyperparameters.get("use_unsloth"):
+        return (
+            "use_liger cannot be combined with use_unsloth: both patch the same "
+            "model modules. Pick one."
+        )
+    if method == "dpo":
+        if hyperparameters.get("lora_rank") is not None or hyperparameters.get("load_in_4bit"):
+            return (
+                "use_liger with DPO supports full fine-tunes only, not lora_rank or "
+                "load_in_4bit (TRL's liger DPO loss does not support PEFT models). "
+                "Drop use_liger or the LoRA settings."
+            )
+        loss_type = hyperparameters.get("loss_type", "sigmoid")
+        if loss_type not in LIGER_DPO_LOSS_TYPES:
+            return (
+                f"use_liger does not support DPO loss_type '{loss_type}'. With use_liger, "
+                f"loss_type must be one of: {', '.join(LIGER_DPO_LOSS_TYPES)}. "
+                "Drop use_liger or pick one of those."
+            )
+    return None
 
 
 def _maybe_enable_tunableop(hyperparameters: dict[str, Any]) -> None:
@@ -1980,14 +2027,23 @@ def run_training(
                 "load_in_4bit is not supported on ROCm (bitsandbytes is CUDA-only)"
             )
 
-    # use_liger needs the liger-kernel package on the box (the ROCm bootstrap
-    # installs it; other images may not). Fail fast with the reason, not an
-    # opaque transformers ImportError after the model download.
+    # use_liger needs the liger-kernel package on the box (baked into the AWS
+    # worker AMI, the Vast and GCP images, and installed by the ROCm bootstrap;
+    # older images lack it). Fail fast with the reason, not an opaque
+    # transformers ImportError after the model download.
     if hyperparameters.get("use_liger") and not _liger_available():
         raise ValueError(
             "use_liger requires the liger-kernel package, which is not "
             "installed on this worker image"
         )
+    # Then the configs liger crashes on. The control plane rejects these at
+    # submit; this repeats the check for configs that did not pass through it.
+    if hyperparameters.get("use_liger"):
+        reason = liger_incompatibility(
+            method, int(job_config.get("gpu_count", 1) or 1), hyperparameters
+        )
+        if reason:
+            raise ValueError(reason)
 
     _maybe_enable_tunableop(hyperparameters)
     _maybe_prefer_hipblaslt(hyperparameters)
