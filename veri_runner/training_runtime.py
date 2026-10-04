@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -478,6 +479,74 @@ def build_trainer_kwargs(
     return trainer_kwargs
 
 
+def _batch_knobs(
+    hyperparameters: dict[str, Any], launch_plan: dict[str, Any] | None
+) -> tuple[int, int | None, bool, str]:
+    """(micro_batch_size, gradient_accumulation_steps | None, gradient_checkpointing,
+    precision) for a config builder: from the resolved launch plan when the job
+    runs under the multi-GPU launcher, else straight from the playbook knobs
+    (`batch_size` stays the legacy alias of `micro_batch_size`). A None ga means
+    "do not set the key", which keeps a knob-free single-GPU job byte-for-byte
+    today's config."""
+    if launch_plan:
+        return (
+            int(launch_plan["micro_batch_size"]),
+            int(launch_plan["gradient_accumulation_steps"]),
+            bool(launch_plan["gradient_checkpointing"]),
+            str(launch_plan["precision"]),
+        )
+    mbs = int(hyperparameters.get("micro_batch_size") or hyperparameters.get("batch_size") or 1)
+    ga = hyperparameters.get("gradient_accumulation_steps")
+    gbs = hyperparameters.get("global_batch_size")
+    if ga is None and gbs:
+        # dp = 1 in-process: gbs = mbs x ga (the control plane checked divisibility)
+        ga = max(1, int(gbs) // mbs)
+    gc = hyperparameters.get("gradient_checkpointing")
+    return (
+        mbs,
+        None if ga is None else int(ga),
+        True if gc is None else bool(gc),
+        str(hyperparameters.get("precision") or "bf16"),
+    )
+
+
+def _bf16_flag(precision: str, launch_plan: dict[str, Any] | None) -> bool:
+    """TrainingArguments.bf16 for a precision + backend. fp32 never; pure bf16
+    under FSDP2 never (accelerate 1.15 upcasts every trainable param to fp32
+    master weights whenever its mixed precision is not 'no', fsdp_utils.py:816);
+    everything else is today's GPU probe (bf16 autocast on a bf16 or fp32 load)."""
+    if precision == "fp32":
+        return False
+    if launch_plan and launch_plan.get("backend") == "fsdp2" and precision == "bf16":
+        return False
+    return _gpu_supports_bf16()
+
+
+def _apply_batch_knobs(
+    config_kwargs: dict[str, Any],
+    hyperparameters: dict[str, Any],
+    launch_plan: dict[str, Any] | None,
+) -> None:
+    mbs, ga, gc, precision = _batch_knobs(hyperparameters, launch_plan)
+    config_kwargs["per_device_train_batch_size"] = mbs
+    config_kwargs["bf16"] = _bf16_flag(precision, launch_plan)
+    # Under FSDP2 recomputation is done by accelerate (fsdp_activation_checkpointing
+    # in the launch config); the Trainer flag would add a redundant all-gather
+    # per layer in backward (transformers#30404).
+    fsdp = bool(launch_plan) and launch_plan.get("backend") == "fsdp2"
+    config_kwargs["gradient_checkpointing"] = gc and not fsdp
+    if ga is not None:
+        config_kwargs["gradient_accumulation_steps"] = ga
+    if launch_plan and int(launch_plan.get("world_size", 1)) > 1:
+        # Q13 / Q-D: the NCCL process-group timeout bounds a dead peer; it is
+        # stretched around the estimated rank-0 checkpoint write (HF default 1800 s).
+        config_kwargs["ddp_timeout"] = int(launch_plan.get("ddp_timeout_s") or 600)
+        if launch_plan.get("backend") == "ddp":
+            # HF turns this on for any PeftModel; every adapter param gets a
+            # gradient, and the unused-parameter scan costs a graph walk per step.
+            config_kwargs["ddp_find_unused_parameters"] = False
+
+
 def build_sft_config_kwargs(
     *,
     job_id: str,
@@ -488,6 +557,8 @@ def build_sft_config_kwargs(
     # VS-393: the control plane's computed save policy. None => no
     # intermediate checkpoints, i.e. exactly pre-VS-393 behaviour.
     checkpoint: dict[str, Any] | None = None,
+    # VS-476: the resolved multi-GPU plan when running under accelerate launch.
+    launch_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build SFTConfig kwargs while adapting to the installed TRL signature.
 
@@ -501,12 +572,10 @@ def build_sft_config_kwargs(
         "output_dir": str(Path(output_root) / job_id),
         "learning_rate": hyperparameters.get("learning_rate", 2e-5),
         "num_train_epochs": hyperparameters.get("num_epochs", 1),
-        "per_device_train_batch_size": hyperparameters.get("batch_size", 1),
         "logging_steps": 1,
         "report_to": "wandb" if wandb_enabled else "none",
-        "bf16": _gpu_supports_bf16(),
-        "gradient_checkpointing": True,
     }
+    _apply_batch_knobs(config_kwargs, hyperparameters, launch_plan)
     if hyperparameters.get("max_steps"):
         config_kwargs["max_steps"] = hyperparameters["max_steps"]
     if "packing" in sft_params:
@@ -539,6 +608,8 @@ def build_dpo_config_kwargs(
     # VS-393: the control plane's computed save policy. None => no
     # intermediate checkpoints, i.e. exactly pre-VS-393 behaviour.
     checkpoint: dict[str, Any] | None = None,
+    # VS-476: the resolved multi-GPU plan when running under accelerate launch.
+    launch_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build DPOConfig kwargs while adapting to the installed TRL signature.
 
@@ -553,12 +624,24 @@ def build_dpo_config_kwargs(
         "output_dir": str(Path(output_root) / job_id),
         "learning_rate": hyperparameters.get("learning_rate", 5e-6),
         "num_train_epochs": hyperparameters.get("num_epochs", 1),
-        "per_device_train_batch_size": hyperparameters.get("batch_size", 1),
         "logging_steps": 1,
         "report_to": "wandb" if wandb_enabled else "none",
-        "bf16": _gpu_supports_bf16(),
-        "gradient_checkpointing": True,
     }
+    _apply_batch_knobs(config_kwargs, hyperparameters, launch_plan)
+    # Reference model under the launcher (full FT only; with LoRA, TRL keeps a
+    # frozen copy of the adapter instead of a second base): TRL builds it from
+    # `model_init_kwargs` with dtype fp32 and nulls device_map only for
+    # MULTI_GPU / DEEPSPEED (dpo_trainer.py:806-813), so under FSDP a bare
+    # config would try device_map="auto" and load 2x the memory it needs.
+    if (
+        launch_plan
+        and int(launch_plan.get("world_size", 1)) > 1
+        and not launch_plan.get("lora")
+        and "model_init_kwargs" in dpo_params
+    ):
+        # bf16 for every precision: the reference only runs forward (under
+        # autocast for bf16_mixed), so fp32 would double its memory for nothing.
+        config_kwargs["model_init_kwargs"] = {"dtype": "bfloat16", "device_map": None}
     if hyperparameters.get("max_steps"):
         config_kwargs["max_steps"] = hyperparameters["max_steps"]
     if "beta" in dpo_params:
@@ -656,6 +739,25 @@ def _save_merged_for_push(
     return merged_dir
 
 
+def _merge_adapter_from_path(
+    *, base_model: str, adapter_dir: str, merged_dir: str, log: logging.Logger
+) -> str:
+    """Merge a saved LoRA adapter into a freshly loaded base and save a
+    standalone model dir (CPU/bf16 is fine: this runs after training)."""
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    log.info("Merging adapter %s into %s -> %s", adapter_dir, base_model, merged_dir)
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model, torch_dtype=torch.bfloat16, trust_remote_code=_allow_remote_code(base_model)
+    )
+    merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
+    merged.save_pretrained(merged_dir)
+    AutoTokenizer.from_pretrained(adapter_dir).save_pretrained(merged_dir)
+    return merged_dir
+
+
 def push_to_hf_hub(
     *,
     job_config: dict[str, Any],
@@ -702,6 +804,16 @@ def push_to_hf_hub(
                 )
                 return None
             upload_dir = final_dir
+        elif is_adapter_ckpt and trainer is None:
+            # VS-476: the worker parent pushes after a multi-GPU run from the
+            # saved adapter; no trainer lives in this process, so merge from
+            # disk (fresh base + adapter) now that the GPUs are free.
+            upload_dir = _merge_adapter_from_path(
+                base_model=job_config["base_model"],
+                adapter_dir=final_dir,
+                merged_dir=str(Path(final_dir).parent / "merged"),
+                log=log,
+            )
         elif is_adapter_ckpt:
             # merged requested from a LoRA run: materialize standalone weights
             # next to the adapter checkpoint before uploading.
@@ -767,10 +879,52 @@ def _allow_remote_code(base_model: str) -> bool:
     return base_model in allowed
 
 
+def _model_placement(
+    hyperparameters: dict[str, Any], launch_plan: dict[str, Any] | None
+) -> tuple[str, Any]:
+    """(torch dtype attribute name, device_map) for the vanilla load path.
+
+    No plan (single GPU, in-process): today's `device_map="auto"`, bf16 unless
+    `precision` asks for fp32 master weights (bf16_mixed = fp32 load + autocast;
+    fp32 = fp32 end to end).
+    DDP: one full copy per rank on its own device (`{"": local_rank}`; None on a
+    CPU-only box so the gloo integration path works); fp32 load for bf16_mixed.
+    FSDP2: no device_map; every rank loads the full model into host RAM (the
+    process group does not exist yet, so accelerate's rank-0-only loading cannot
+    apply) and `fully_shard` keeps each rank's slice; bf16 load even for
+    bf16_mixed because accelerate upcasts the sharded trainable params to fp32
+    master weights itself.
+    """
+    precision = str(
+        (launch_plan or {}).get("precision") or hyperparameters.get("precision") or "bf16"
+    )
+    lora = hyperparameters.get("lora_rank") is not None
+    # LoRA + bf16_mixed = frozen bf16 base, fp32 adapters (PEFT autocasts adapter
+    # weights to fp32 on a half-precision base), so the base never loads in fp32
+    # unless precision is fp32 outright.
+    if precision == "bf16" or (precision == "bf16_mixed" and lora):
+        dtype = "bfloat16"
+    elif precision == "bf16_mixed" and launch_plan and launch_plan.get("backend") == "fsdp2":
+        dtype = "bfloat16"  # accelerate upcasts the sharded master copy to fp32 itself
+    else:
+        dtype = "float32"
+    if not launch_plan or int(launch_plan.get("world_size", 1)) <= 1:
+        return dtype, "auto"
+    if launch_plan.get("backend") == "fsdp2":
+        return dtype, None
+    import torch
+
+    device_map = (
+        {"": int(os.environ.get("LOCAL_RANK", "0"))} if torch.cuda.is_available() else None
+    )
+    return dtype, device_map
+
+
 def _load_model_and_tokenizer(
     base_model: str,
     hyperparameters: dict[str, Any],
     logger: logging.Logger,
+    launch_plan: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """Load model+tokenizer via Unsloth (opt-in) or vanilla transformers (default).
 
@@ -862,9 +1016,10 @@ def _load_model_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    dtype_name, device_map = _model_placement(hyperparameters, launch_plan)
     model_kwargs: dict[str, Any] = {
-        "torch_dtype": torch.bfloat16,
-        "device_map": "auto",
+        "torch_dtype": getattr(torch, dtype_name),
+        "device_map": device_map,
         "trust_remote_code": allow_remote_code,
     }
     if load_in_4bit:
@@ -979,21 +1134,41 @@ def _prepare_trl_framework(hyperparameters: dict[str, Any], log: logging.Logger)
 
 
 def _attach_progress_callback(
-    trainer: Any, progress_fn: Callable[[int, int, dict], None] | None
+    trainer: Any,
+    progress_fn: Callable[[int, int, dict], None] | None,
+    phase_fn: Callable[[str, int], None] | None = None,
 ) -> None:
     """Register step-level progress reporting on any HF Trainer (no-op when
-    the adapter didn't pass a progress_fn)."""
-    if not progress_fn:
+    the adapter didn't pass a progress_fn).
+
+    Multi-process (VS-476): every rank runs the callbacks, only the world's
+    process zero reports. `phase_fn` marks the save window ("saving" from the
+    step whose save is pending until on_save, then "training") so the parent's
+    stall watchdog can stretch its budget around a long FULL_STATE_DICT write
+    instead of killing a healthy job.
+    """
+    if not progress_fn and not phase_fn:
         return
     from transformers import TrainerCallback
 
+    def _main(state) -> bool:
+        return bool(getattr(state, "is_world_process_zero", True))
+
     class _ProgressCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs and state:
+            if logs and state and progress_fn and _main(state):
                 progress_fn(state.global_step, state.max_steps, {
                     k: float(v) for k, v in logs.items()
                     if isinstance(v, (int, float))
                 })
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if phase_fn and _main(state) and getattr(control, "should_save", False):
+                phase_fn("saving", int(state.global_step))
+
+        def on_save(self, args, state, control, **kwargs):
+            if phase_fn and _main(state):
+                phase_fn("training", int(state.global_step))
 
     trainer.add_callback(_ProgressCallback())
 
@@ -1086,20 +1261,44 @@ def _train_save_finalize(
     job_config: dict[str, Any],
     wandb_enabled: bool,
     log: logging.Logger,
+    launch_plan: dict[str, Any] | None = None,
+    phase_fn: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
     """The shared tail of every TRL method: train, save the checkpoint, build
-    the result dict, and capture/finish the W&B run if one is live."""
+    the result dict, and capture/finish the W&B run if one is live.
+
+    Under the multi-GPU launcher (VS-476) every rank trains and takes part in
+    the (collective) final save; rank 0 alone writes the tokenizer and owns the
+    result, and nobody pushes to the Hub: the parent does that from the saved
+    artifact once the GPUs are free.
+    """
+    distributed = bool(launch_plan) and int(launch_plan.get("world_size", 1)) > 1
+    if distributed:
+        _force_fp32_grad_reduce(trainer, launch_plan)
     t0 = time.time()
     train_result = trainer.train()
     train_time = time.time() - t0
     log.info("Training completed in %.1fs, loss=%.4f", train_time, train_result.training_loss)
 
-    final_dir = save_checkpoint(
-        trainer=trainer,
-        tokenizer=tokenizer,
-        job_id=job_config["job_id"],
-        output_root=checkpoint_output_root(job_config),
-    )
+    if distributed:
+        final_dir = str(
+            Path(checkpoint_output_root(job_config)) / job_config["job_id"] / "final"
+        )
+        step = int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0)
+        if phase_fn and _rank() == 0:
+            phase_fn("saving", step)  # the final gather + write can take minutes
+        trainer.save_model(final_dir)  # collective: FSDP gathers, rank 0 writes
+        if _rank() == 0:
+            tokenizer.save_pretrained(final_dir)
+            if phase_fn:
+                phase_fn("finalizing", step)
+    else:
+        final_dir = save_checkpoint(
+            trainer=trainer,
+            tokenizer=tokenizer,
+            job_id=job_config["job_id"],
+            output_root=checkpoint_output_root(job_config),
+        )
 
     result = {
         "train_time_s": train_time,
@@ -1107,6 +1306,10 @@ def _train_save_finalize(
         "checkpoint_dir": final_dir,
         "checkpoint": job_config.get("checkpoint"),
     }
+    if distributed:
+        result["world_size"] = int(launch_plan["world_size"])
+        result["plan"] = launch_plan.get("summary")
+        result["peak_memory_bytes_per_rank"] = _gather_peak_memory()
     if wandb_enabled:
         try:
             import wandb
@@ -1116,6 +1319,9 @@ def _train_save_finalize(
                 wandb.finish()
         except Exception:
             pass
+
+    if distributed:
+        return result  # the parent pushes from the artifact (section 4 step 6)
 
     hf_url = push_to_hf_hub(
         job_config=job_config,
@@ -1731,6 +1937,9 @@ def run_sft_text_training(
     # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
     # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
+    # VS-476: multi-GPU child: the resolved plan + the rank-0 phase writer.
+    launch_plan: dict[str, Any] | None = None,
+    phase_fn: Callable[[str, int], None] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Supervised fine-tuning on text via TRL SFTTrainer.
@@ -1768,7 +1977,9 @@ def run_sft_text_training(
     validate_rows_for_method(rows, "sft_text")
 
     t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
+    model, tokenizer = _load_model_and_tokenizer(
+        base_model, hyperparameters, log, launch_plan=launch_plan
+    )
     log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
@@ -1792,6 +2003,7 @@ def run_sft_text_training(
             output_root=checkpoint_output_root(job_config),
             wandb_enabled=wandb_enabled,
             checkpoint=job_config.get("checkpoint"),
+            launch_plan=launch_plan,
         )
     )
     trainer = SFTTrainer(
@@ -1804,7 +2016,7 @@ def run_sft_text_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn)
+    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
     return _train_save_finalize(
         trainer=trainer,
@@ -1812,6 +2024,8 @@ def run_sft_text_training(
         job_config=job_config,
         wandb_enabled=wandb_enabled,
         log=log,
+        launch_plan=launch_plan,
+        phase_fn=phase_fn,
     )
 
 
@@ -1847,6 +2061,9 @@ def run_dpo_training(
     # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
     # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
+    # VS-476: multi-GPU child: the resolved plan + the rank-0 phase writer.
+    launch_plan: dict[str, Any] | None = None,
+    phase_fn: Callable[[str, int], None] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Direct Preference Optimization via TRL DPOTrainer.
@@ -1886,7 +2103,9 @@ def run_dpo_training(
     dataset = Dataset.from_list(rows)
 
     t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
+    model, tokenizer = _load_model_and_tokenizer(
+        base_model, hyperparameters, log, launch_plan=launch_plan
+    )
     log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
@@ -1899,6 +2118,7 @@ def run_dpo_training(
             output_root=checkpoint_output_root(job_config),
             wandb_enabled=wandb_enabled,
             checkpoint=job_config.get("checkpoint"),
+            launch_plan=launch_plan,
         )
     )
     trainer = DPOTrainer(
@@ -1911,7 +2131,7 @@ def run_dpo_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn)
+    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
     return _train_save_finalize(
         trainer=trainer,
@@ -1919,6 +2139,8 @@ def run_dpo_training(
         job_config=job_config,
         wandb_enabled=wandb_enabled,
         log=log,
+        launch_plan=launch_plan,
+        phase_fn=phase_fn,
     )
 
 
@@ -2074,3 +2296,632 @@ def run_training(
             )
         return run_sft_video_gen_training(job_config, **kwargs)
     raise ValueError(f"Unknown training method: {method}")
+
+
+# ---- Multi-GPU managed launch (VS-476, phase 1) ----
+#
+# gpu_count > 1 on sft_text / dpo runs one process per GPU under
+# `accelerate launch` (DDP when the model states fit one GPU, FSDP2 ZeRO-3
+# when they do not, ZeRO-2 on request). The worker agent (the parent, which
+# never touches CUDA) resolves the plan, writes the accelerate config and a
+# secret-free child config, spawns the launcher and reads the files the ranks
+# leave behind: progress.jsonl, result.json, checkpoint-N/, final/ and the
+# torchelastic per-rank error files. Knob names follow the Ultra-Scale
+# Playbook (zero_stage, *_parallel_size, micro_batch_size,
+# gradient_accumulation_steps, global_batch_size, gradient_checkpointing,
+# precision, cpu_offload). Single-GPU jobs never come through here.
+
+PRECISIONS = ("bf16", "bf16_mixed", "fp32")
+# Share of GPU memory the model states (weights, grads, optimizer, reference
+# model) may take; activations, the CUDA context and NCCL buffers get the rest.
+MEMORY_BUDGET_FRACTION = 0.7
+_TORCH_DTYPE_BYTES = {
+    "bfloat16": 2, "float16": 2, "half": 2, "float32": 4, "float": 4, "float64": 8,
+    "int8": 1, "uint8": 1, "float8_e4m3fn": 1, "float8_e5m2": 1,
+}
+# Per-GPU memory the CUDA context and NCCL buffers take before the model
+# (ml-engineering: torch.distributed ~1-2 GiB per GPU at init, invisible to the
+# torch profiler). Subtracted from NVML total before the 0.7 budget.
+GPU_RESERVED_BYTES = 2 * 1024**3
+# Rank-0 FULL_STATE_DICT write rate on a stock gp3 root (Q-D); the process-group
+# timeout and the stall watchdog stretch around 2 x this estimate.
+CHECKPOINT_WRITE_BYTES_PER_S = 100 * 10**6
+# The ONLY keys the ranks get from the job config (allowlist, so a new secret-
+# carrying field can never leak by omission). Rows arrive via dataset_path, the
+# W&B key via the env, credentials and callbacks stay in the parent.
+_CHILD_CONFIG_ALLOW = (
+    "job_id", "method", "base_model", "hyperparameters", "checkpoint", "output_name",
+    "wandb_project", "gpu_count", "gpu_type", "provider", "num_nodes", "system_prompt",
+)
+
+
+def _safetensors_param_count(path: Path) -> int | None:
+    """Parameter count from a .safetensors header (8-byte little-endian header
+    length, then JSON), without loading any tensor."""
+    try:
+        with open(path, "rb") as f:
+            n = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(n))
+    except (OSError, ValueError):
+        return None
+    total = 0
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        count = 1
+        for dim in entry.get("shape", []):
+            count *= int(dim)
+        total += count
+    return total or None
+
+
+def _formula_param_count(cfg: dict[str, Any]) -> int | None:
+    """Playbook estimate N = h*v + L(12h^2 + 13h) + 2h (PB, Memory for weights,
+    grads and optimizer states) from config.json."""
+    try:
+        h = int(cfg["hidden_size"])
+        v = int(cfg["vocab_size"])
+        layers = int(cfg["num_hidden_layers"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return h * v + layers * (12 * h * h + 13 * h) + 2 * h
+
+
+def read_model_meta(model_dir: str) -> dict[str, Any]:
+    """What the plan resolver needs from a downloaded model: the exact parameter
+    count (safetensors index total_size / dtype bytes, else a single-file
+    header, else the playbook formula) and the config fields the phase-3
+    preflight will check. Never raises; an unknown count is None."""
+    root = Path(model_dir)
+    cfg: dict[str, Any] = {}
+    try:
+        cfg = json.loads((root / "config.json").read_text())
+    except (OSError, ValueError):
+        pass
+    dtype = str(cfg.get("torch_dtype") or cfg.get("dtype") or "bfloat16")
+    meta: dict[str, Any] = {
+        "dtype": dtype,
+        "config": {
+            k: cfg.get(k)
+            for k in ("architectures", "hidden_size", "num_hidden_layers", "vocab_size",
+                      "num_attention_heads", "num_key_value_heads", "tie_word_embeddings")
+        },
+    }
+    index = root / "model.safetensors.index.json"
+    if index.exists():
+        try:
+            total = int(json.loads(index.read_text()).get("metadata", {}).get("total_size") or 0)
+        except (OSError, ValueError):
+            total = 0
+        if total:
+            meta.update(param_count=total // _TORCH_DTYPE_BYTES.get(dtype, 2),
+                        param_count_source="safetensors_index")
+            return meta
+    single = root / "model.safetensors"
+    if single.exists():
+        n = _safetensors_param_count(single)
+        if n:
+            meta.update(param_count=n, param_count_source="safetensors_header")
+            return meta
+    n = _formula_param_count(cfg)
+    if n:
+        meta.update(param_count=n, param_count_source="config_formula")
+        return meta
+    meta.update(param_count=None, param_count_source="unknown")
+    return meta
+
+
+def resolve_parallel_plan(
+    hyperparameters: dict[str, Any] | None,
+    *,
+    method: str,
+    gpu_count: int,
+    gpu_memory_bytes: int,
+    model_meta: dict[str, Any],
+    host_memory_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Pure: the playbook knobs + model size + GPU memory -> the launch plan,
+    with a decision trace (spec section 3.1).
+
+    Model states S: full FT 8N (bf16) or 16N (bf16_mixed / fp32); + 2N for a
+    reference model (DPO full FT, GRPO full FT with kl_coef > 0); LoRA 2N
+    (frozen bf16 base; 4N when precision is fp32); QLoRA ~0.6N. Budget B =
+    0.7 x (GPU memory - 2 GiB CUDA/NCCL reserve). "auto": S <= B -> stage 0
+    (DDP), else 3 (FSDP2 full shard); cpu_offload forces 3. Phase 1 never
+    auto-picks 2. Per GPU at stage 3 the sharded states are S/dp, but TRL wraps
+    a DPO reference model as ONE FSDP unit, so its full 2N is gathered on every
+    rank during its forward and is counted whole. Not fitting even at stage 3
+    WARNS, never blocks; so does W full copies not fitting host RAM (every rank
+    loads the whole model before sharding).
+    """
+    hp = dict(hyperparameters or {})
+    world = int(gpu_count)
+    tp = cp = pp = 1  # phase 3 lifts these
+    dp = world // (tp * cp * pp)
+    precision = str(hp.get("precision") or "bf16")
+    if precision not in PRECISIONS:
+        raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+    lora = hp.get("lora_rank") is not None
+    qlora = bool(hp.get("load_in_4bit"))
+    gc = hp.get("gradient_checkpointing")
+    gc = True if gc is None else bool(gc)
+    cpu_offload = bool(hp.get("cpu_offload"))
+    trace: list[str] = [f"world_size={world} dp={dp} tp={tp} cp={cp} pp={pp}"]
+    warnings: list[str] = []
+
+    n = model_meta.get("param_count")
+    source = model_meta.get("param_count_source", "unknown")
+    states: int | None = None  # everything that lives on the GPUs for the whole run
+    weights: int | None = None  # the (host-RAM) copy each rank loads before sharding
+    reference = 0  # a DPO / GRPO reference model: one FSDP unit, gathered whole
+    checkpoint_bytes = 0  # a resumable checkpoint (weights + optimizer), rank 0 writes
+    if n is not None:
+        n = int(n)
+        if qlora:
+            states = weights = int(0.6 * n)
+            trace.append(f"params={n:,} ({source}); QLoRA: model_states~0.6N={states / 1e9:.1f} GB")
+        elif lora:
+            weights = 4 * n if precision == "fp32" else 2 * n
+            states = weights
+            trace.append(
+                f"params={n:,} ({source}); LoRA: frozen "
+                f"{'fp32' if precision == 'fp32' else 'bf16'} base {weights // n}N="
+                f"{states / 1e9:.1f} GB"
+            )
+        else:
+            per_param = 8 if precision == "bf16" else 16
+            weights = 2 * n if precision == "bf16" else 4 * n
+            states = per_param * n
+            checkpoint_bytes = (6 if precision == "bf16" else 12) * n
+            line = (
+                f"params={n:,} ({source}); full FT {precision}: "
+                f"{per_param}N={states / 1e9:.1f} GB"
+            )
+            has_reference = method == "dpo" or (
+                method == "grpo" and float(hp.get("kl_coef") or 0.0) > 0.0
+            )
+            if has_reference:
+                reference = 2 * n
+                states += reference
+                line += f" + reference model 2N = {states / 1e9:.1f} GB"
+            trace.append(line)
+    usable = max(0, int(gpu_memory_bytes) - GPU_RESERVED_BYTES)
+    budget = int(MEMORY_BUDGET_FRACTION * usable)
+    trace.append(
+        f"budget={budget / 1e9:.1f} GB = {MEMORY_BUDGET_FRACTION} x "
+        f"({int(gpu_memory_bytes) / 1e9:.1f} GB - {GPU_RESERVED_BYTES / 1e9:.1f} GB reserve) "
+        f"per GPU"
+    )
+
+    requested = hp.get("zero_stage", "auto")
+    if requested is None:
+        requested = "auto"
+    if requested == "auto":
+        if cpu_offload:
+            stage, why = 3, "auto: cpu_offload requires FSDP, sharding parameters"
+        elif states is None:
+            stage, why = 0, "auto: parameter count unknown, data parallel by default"
+            warnings.append(
+                "parameter count unknown (no safetensors index, header or config.json "
+                "sizes); memory fit was not checked. Set zero_stage explicitly if the "
+                "model does not fit one GPU."
+            )
+        elif states <= budget:
+            stage, why = 0, "auto: model states fit one GPU, data parallel"
+        else:
+            stage, why = 3, "auto: model states exceed one GPU, sharding parameters (ZeRO-3)"
+    else:
+        stage = int(requested)
+        if stage not in (0, 2, 3):
+            raise ValueError(f"zero_stage must be auto, 0, 2 or 3, got {requested!r}")
+        if stage == 0 and cpu_offload:
+            raise ValueError("cpu_offload requires zero_stage 2 or 3 (FSDP)")
+        why = "explicit"
+    backend = "ddp" if stage == 0 else "fsdp2"
+
+    per_gpu: int | None = None
+    if states is not None and weights is not None:
+        sharded = states - reference
+        if stage == 0:
+            per_gpu = states
+        elif stage == 2:
+            per_gpu = (weights - 0) + (sharded - weights) // dp + reference
+        else:
+            per_gpu = sharded // dp + reference
+        if cpu_offload:
+            per_gpu = reference  # params / grads / optimizer live in host RAM
+        trace.append(
+            f"zero_stage={stage} ({why}); backend={backend}; "
+            f"model_states_per_gpu={per_gpu / 1e9:.1f} GB"
+            + (
+                f" (incl. reference model {reference / 1e9:.1f} GB gathered whole)"
+                if reference and stage
+                else ""
+            )
+        )
+        if per_gpu > budget:
+            options = "lora_rank, more GPUs, precision"
+            if not cpu_offload:
+                options += ", cpu_offload"
+            if stage == 0:
+                options += ", zero_stage 3"
+            warnings.append(
+                f"estimated {per_gpu / 1e9:.1f} GB/GPU of model states > {budget / 1e9:.1f} GB "
+                f"budget; expect OOM. Options: {options}"
+            )
+        host_needed = weights * world + (states if cpu_offload else 0)
+        if host_memory_bytes and host_needed > 0.8 * int(host_memory_bytes):
+            warnings.append(
+                f"every rank loads the full model before sharding: {world} x "
+                f"{weights / 1e9:.1f} GB{' + offloaded states' if cpu_offload else ''} = "
+                f"{host_needed / 1e9:.1f} GB of host RAM > 80% of "
+                f"{int(host_memory_bytes) / 1e9:.1f} GB; expect the kernel OOM killer. "
+                f"Options: fewer GPUs per node, lora_rank, a smaller base model"
+            )
+    else:
+        trace.append(f"zero_stage={stage} ({why}); backend={backend}")
+    if backend == "fsdp2" and checkpoint_bytes:
+        checkpoint_bytes += weights or 0  # HF also writes pytorch_model_fsdp.bin
+    timeout_s = int(max(600.0, 2.0 * checkpoint_bytes / CHECKPOINT_WRITE_BYTES_PER_S))
+
+    mbs = int(hp.get("micro_batch_size") or hp.get("batch_size") or 1)
+    ga_raw = hp.get("gradient_accumulation_steps")
+    gbs_raw = hp.get("global_batch_size")
+    if ga_raw is not None:
+        ga = int(ga_raw)
+    elif gbs_raw:
+        ga = max(1, int(gbs_raw) // (mbs * dp))
+    else:
+        ga = 1
+    gbs = mbs * ga * dp
+    trace.append(
+        f"micro_batch_size={mbs} gradient_accumulation_steps={ga} global_batch_size={gbs} "
+        f"(= mbs x ga x dp) gradient_checkpointing={gc} cpu_offload={cpu_offload}"
+    )
+    summary = (
+        f"plan: dp={dp} zero_stage={stage} tp={tp} cp={cp} mbs={mbs} grad_acc={ga} gbs={gbs} "
+        f"precision={precision} gradient_checkpointing={'on' if gc else 'off'}"
+    )
+    if per_gpu is not None:
+        summary += f" ({why.split(':')[0]}: {per_gpu / 1e9:.1f} GB states/GPU)"
+
+    return {
+        "world_size": world,
+        "dp": dp,
+        "tp": tp,
+        "cp": cp,
+        "pp": pp,
+        "zero_stage": stage,
+        "zero_stage_requested": requested,
+        "backend": backend,
+        "micro_batch_size": mbs,
+        "gradient_accumulation_steps": ga,
+        "global_batch_size": gbs,
+        "gradient_checkpointing": gc,
+        "precision": precision,
+        "cpu_offload": cpu_offload,
+        "lora": lora,
+        "qlora": qlora,
+        "ddp_timeout_s": timeout_s,
+        "estimate": {
+            "param_count": n,
+            "param_count_source": source,
+            "model_states_bytes": states,
+            "reference_model_bytes": reference,
+            "per_gpu_bytes": per_gpu,
+            "budget_bytes": budget,
+            "gpu_memory_bytes": int(gpu_memory_bytes),
+            "host_memory_bytes": int(host_memory_bytes) if host_memory_bytes else None,
+            "checkpoint_bytes": checkpoint_bytes,
+        },
+        "trace": trace,
+        "warnings": warnings,
+        "summary": summary,
+    }
+
+
+def render_accelerate_config(plan: dict[str, Any]) -> str:
+    """The `accelerate launch --config_file` document (JSON; accelerate reads
+    .json or .yaml). Shape of TRL 1.7.1's accelerate_configs/multi_gpu.yaml and
+    fsdp2.yaml on accelerate 1.15 (minus cpu_ram_efficient_loading, see below):
+    ZeRO-2 = FSDP2 without resharding after forward, ZeRO-3 = with.
+    `mixed_precision` is "bf16" only for bf16_mixed: for pure bf16 accelerate
+    would otherwise upcast the sharded params to fp32.
+    """
+    cfg: dict[str, Any] = {
+        "compute_environment": "LOCAL_MACHINE",
+        "debug": False,
+        "downcast_bf16": "no",
+        "enable_cpu_affinity": False,
+        "machine_rank": 0,
+        "main_training_function": "main",
+        "mixed_precision": "bf16" if plan["precision"] == "bf16_mixed" else "no",
+        "num_machines": 1,
+        "num_processes": int(plan["world_size"]),
+        "rdzv_backend": "static",
+        "same_network": True,
+        "use_cpu": False,
+    }
+    if plan["backend"] == "ddp":
+        cfg["distributed_type"] = "MULTI_GPU"
+        cfg["gpu_ids"] = "all"
+    else:
+        cfg["distributed_type"] = "FSDP"
+        cfg["fsdp_config"] = {
+            "fsdp_version": 2,
+            "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+            "fsdp_reshard_after_forward": int(plan["zero_stage"]) == 3,
+            "fsdp_state_dict_type": "FULL_STATE_DICT",
+            # OFF on purpose. The policy loads before the process group exists,
+            # so transformers never takes the rank-0-only path for it; but a DPO
+            # reference model is built AFTER the group is up, and with this on
+            # ranks 1..W-1 would skip loading its weights (modeling_utils: "Skip
+            # it with fsdp on ranks other than 0") while TRL's prepare_fsdp
+            # does no broadcast: silently wrong DPO. Every rank loads every model.
+            "fsdp_cpu_ram_efficient_loading": False,
+            "fsdp_offload_params": bool(plan["cpu_offload"]),
+            "fsdp_activation_checkpointing": bool(plan["gradient_checkpointing"]),
+        }
+    return json.dumps(cfg, indent=2)
+
+
+def build_launch_argv(
+    plan: dict[str, Any],
+    *,
+    config_path: str,
+    child_config_path: str,
+    log_dir: str,
+    script_path: str,
+    python: str | None = None,
+) -> list[str]:
+    """`python -m accelerate.commands.launch ...` for the parent to spawn. No
+    restarts (the parent owns retries), a 5 s failure sweep, every line
+    prefixed with its rank (`--tee 3`) and per-rank logs + torchelastic error
+    files under `log_dir`."""
+    return [
+        python or sys.executable, "-m", "accelerate.commands.launch",
+        "--config_file", config_path,
+        "--num_processes", str(int(plan["world_size"])),
+        "--num_machines", "1",
+        "--machine_rank", "0",
+        "--max_restarts", "0",
+        "--monitor_interval", "5",
+        "--tee", "3",
+        "--log_dir", log_dir,
+        script_path,
+        "--child-config", child_config_path,
+    ]
+
+
+def build_child_config(
+    job_config: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    dataset_path: str,
+    ranks_dir: str,
+    progress_path: str,
+) -> dict[str, Any]:
+    """The file the ranks read: an allowlisted slice of the job config (no
+    secrets, presigned URLs, callbacks, dataset/checkpoint credentials: the
+    parent keeps those), the plan, and the file contract (rows in,
+    progress/result/stacks out)."""
+    scrubbed = {k: job_config[k] for k in _CHILD_CONFIG_ALLOW if k in job_config}
+    return {
+        "job_config": scrubbed,
+        "plan": plan,
+        "dataset_path": dataset_path,
+        "ranks_dir": ranks_dir,
+        "progress_path": progress_path,
+        "result_path": str(Path(progress_path).parent / "result.json"),
+    }
+
+
+def build_child_env(
+    job_config: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    ranks_dir: str,
+    cpu_count: int,
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Environment for the launcher and its ranks (spec section 4 + the
+    ml-engineering research, 10.2): offline Hub (the parent prefetched), one
+    thread pool share per rank, NCCL warnings only unless `debug_nccl`, the
+    flight recorder + desync report so a timeout names the stuck collective,
+    and the W&B key (in the env only, never in the child config)."""
+    env = dict(os.environ if base_env is None else base_env)
+    world = max(1, int(plan["world_size"]))
+    env.update({
+        "PYTHONUNBUFFERED": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "OMP_NUM_THREADS": str(max(1, int(cpu_count) // world)),
+        "NCCL_DEBUG": "WARN",
+        # Watches NCCL's own watchdog thread (not a dead peer): keep, see 10.2 N4.
+        "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "120",
+        # Off by default on torch 2.9.1; without it a timeout logs "stack trace
+        # of the failed collective not found" (10.2 H1).
+        "TORCH_FR_BUFFER_SIZE": "2000",
+        "TORCH_NCCL_DESYNC_DEBUG": "1",
+        "TORCH_FR_DUMP_TEMP_FILE": str(Path(ranks_dir) / "fr_"),
+    })
+    if (job_config.get("hyperparameters") or {}).get("debug_nccl"):
+        env["NCCL_DEBUG"] = "INFO"
+        env["NCCL_DEBUG_FILE"] = str(Path(ranks_dir) / "nccl.%h.%p.log")
+    if job_config.get("wandb_api_key"):
+        env["WANDB_API_KEY"] = str(job_config["wandb_api_key"])
+    return env
+
+
+class RankZeroProgressFile:
+    """Rank 0's progress channel to the parent: one JSON line per log step and
+    per phase change, appended and flushed (the parent tails it)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def _write(self, record: dict[str, Any]) -> None:
+        record = {"t": time.time(), "rank": 0, **record}
+        with open(self.path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+
+    def step(self, step: int, total_steps: int | None, metrics: dict[str, float]) -> None:
+        self._write({"step": int(step), "total_steps": total_steps, "metrics": metrics})
+
+    def phase(self, phase: str, step: int) -> None:
+        self._write({"phase": phase, "step": int(step)})
+
+
+def _rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def _restore_wandb_key(job_config: dict[str, Any], env: Mapping[str, str]) -> None:
+    """The W&B key travels in the env only (never in the child config file);
+    put it back so _setup_wandb enables reporting on rank 0."""
+    if env.get("WANDB_API_KEY") and not job_config.get("wandb_api_key"):
+        job_config["wandb_api_key"] = env["WANDB_API_KEY"]
+
+
+def cast_saved_model_dtype(model_dir: str, dtype_name: str, log: logging.Logger) -> bool:
+    """Q9: a bf16_mixed / fp32 run saves fp32 weights; serving loads bf16 anyway,
+    so the parent rewrites the full-model artifact in the base dtype (half the
+    upload and storage). Adapter-only artifacts are left alone. CPU only."""
+    root = Path(model_dir)
+    if (root / "adapter_config.json").exists():
+        return False
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    dtype = getattr(torch, dtype_name)
+    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=dtype)
+    if all(p.dtype == dtype for p in model.parameters()):
+        return False
+    log.info("Casting the final artifact in %s to %s", model_dir, dtype_name)
+    model.to(dtype).save_pretrained(model_dir)
+    return True
+
+
+def _force_fp32_grad_reduce(trainer: Any, plan: dict[str, Any]) -> bool:
+    """FSDP2 + bf16_mixed: reduce-scatter gradients in fp32 (Q-A). accelerate
+    1.15 maps mixed_precision bf16 to MixedPrecisionPolicy(param bf16, reduce
+    bf16) and has no config key for the reduce dtype; a policy set on the
+    plugin before train() survives set_mixed_precision (override=False) and is
+    what fully_shard reads. DDP bf16_mixed already reduces fp32 grads."""
+    if plan.get("backend") != "fsdp2" or plan.get("precision") != "bf16_mixed":
+        return False
+    import torch
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    plugin = trainer.accelerator.state.fsdp_plugin
+    plugin.mixed_precision_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
+    )
+    return True
+
+
+def _gather_peak_memory() -> list[int]:
+    """Peak allocated bytes of every rank (rank 0 reports them in result.json)."""
+    try:
+        import torch
+        import torch.distributed as dist
+
+        mine = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
+        if dist.is_available() and dist.is_initialized():
+            out: list[Any] = [None] * dist.get_world_size()
+            dist.all_gather_object(out, mine)
+            return [int(x) for x in out]
+        return [mine]
+    except Exception:  # noqa: BLE001 -- telemetry must not fail a finished run
+        return []
+
+
+_STACK_DUMP_FILE: Any = None
+
+
+def _install_stack_dump(ranks_dir: str, rank: int) -> None:
+    """SIGUSR1 -> every thread's Python stack into ranks_dir/stack_<rank>.txt
+    (stdlib faulthandler; the parent signals all ranks before killing a stalled
+    job, 10.2 H3). py-spy is not on the AMI yet."""
+    global _STACK_DUMP_FILE
+    import faulthandler
+    import signal
+
+    os.makedirs(ranks_dir, exist_ok=True)
+    _STACK_DUMP_FILE = open(Path(ranks_dir) / f"stack_{rank}.txt", "w")
+    faulthandler.register(signal.SIGUSR1, file=_STACK_DUMP_FILE, all_threads=True)
+
+
+def _child_main(argv: list[str] | None = None) -> int:
+    """One rank of a managed multi-GPU job (launched by the worker parent)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="training_runtime")
+    parser.add_argument("--child-config", required=True)
+    args = parser.parse_args(argv)
+    with open(args.child_config) as f:
+        child = json.load(f)
+    job_config, plan = child["job_config"], child["plan"]
+    rank = _rank()
+    ranks_dir = child.get("ranks_dir") or str(Path(args.child_config).parent / "ranks")
+    _install_stack_dump(ranks_dir, rank)
+    logging.basicConfig(
+        level=logging.INFO, format=f"[rank {rank}] %(asctime)s %(levelname)s %(message)s"
+    )
+    log = logging.getLogger("veri.training_runtime")
+    # Test hook (the CPU integration test): make one rank fail before training
+    # so the parent's root-cause picker has a real torchelastic error file.
+    fail_rank = os.environ.get("VERI_CHILD_FAIL_RANK")
+    if fail_rank is not None and int(fail_rank) == rank:
+        raise RuntimeError(f"injected failure on rank {rank} (VERI_CHILD_FAIL_RANK)")
+    _restore_wandb_key(job_config, os.environ)
+    progress = (
+        RankZeroProgressFile(child["progress_path"])
+        if rank == 0 and child.get("progress_path")
+        else None
+    )
+    if rank == 0:
+        log.info("launch plan:\n  %s", "\n  ".join(plan.get("trace", [])))
+        for w in plan.get("warnings", []):
+            log.warning("plan: %s", w)
+    result = run_training(
+        job_config,
+        dataset_path=child.get("dataset_path"),
+        logger=log,
+        progress_fn=progress.step if progress else None,
+        phase_fn=progress.phase if progress else None,
+        launch_plan=plan,
+    )
+    if rank == 0 and child.get("result_path"):
+        tmp = child["result_path"] + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(result, f)
+        os.replace(tmp, child["result_path"])
+    _destroy_process_group()
+    return 0
+
+
+def _destroy_process_group() -> None:
+    """Tear the collective group down before interpreter exit (torch warns about
+    a live group at exit; on macOS/gloo a live group aborts the process)."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+    except Exception:  # noqa: BLE001 -- teardown must not turn success into failure
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Child entrypoint under torchelastic's @record: an exception on any rank
+    is written to its TORCHELASTIC_ERROR_FILE (the parent's root-cause input)."""
+    from torch.distributed.elastic.multiprocessing.errors import record
+
+    return record(_child_main)(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
