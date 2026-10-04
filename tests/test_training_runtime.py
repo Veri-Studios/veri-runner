@@ -183,6 +183,29 @@ def test_build_grpo_config_kwargs_defaults_omitted_hyperparameters():
     assert kwargs["max_steps"] == 100
 
 
+def test_build_grpo_config_kwargs_applies_seed():
+    """`seed` maps 1:1 onto GRPOConfig.seed (TrainingArguments.seed in TRL
+    1.7.1; GRPOTrainer seeds sampling and init with it). It used to be
+    accepted and silently dropped, so every run used TRL's default 42.
+    Omitted, it stays unset so TRL's default (42, the API default) applies."""
+
+    class FakeGRPOConfig:
+        def __init__(self, seed=42, beta=None):
+            pass
+
+    kwargs = build_grpo_config_kwargs(
+        job_id="job-123",
+        hyperparameters={"seed": 7},
+        grpo_config_cls=FakeGRPOConfig,
+    )
+    assert kwargs["seed"] == 7
+
+    kwargs = build_grpo_config_kwargs(
+        job_id="job-123", hyperparameters={}, grpo_config_cls=FakeGRPOConfig,
+    )
+    assert "seed" not in kwargs
+
+
 def test_build_grpo_config_kwargs_omits_unsupported_parameters():
     class OldGRPOConfig:
         def __init__(self):
