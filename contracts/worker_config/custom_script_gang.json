@@ -11,6 +11,7 @@
   "provider": "aws",
   "worker_code_version": "deadbeef",
   "sandbox_mode": false,
+  "multi_gpu_launcher": false,
   "num_nodes": 4,
   "status_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/status",
   "checkpoint_callback_url": "https://api.veri.studio/v1/training_jobs/job-test/presigned-upload",

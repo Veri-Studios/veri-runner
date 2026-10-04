@@ -11,6 +11,7 @@
   "provider": "aws",
   "worker_code_version": "deadbeef",
   "sandbox_mode": false,
+  "multi_gpu_launcher": false,
   "num_nodes": 1,
   "dataset": { "source_type": "hf", "hf_dataset": "openai/gsm8k" },
   "dataset_download_url": "https://s3.example/data.jsonl?sig=x",
