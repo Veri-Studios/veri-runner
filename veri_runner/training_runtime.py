@@ -429,6 +429,12 @@ def build_grpo_config_kwargs(
         config_kwargs["max_prompt_length"] = hyperparameters["max_prompt_length"]
     if "beta" in grpo_params and "kl_coef" in hyperparameters:
         config_kwargs["beta"] = hyperparameters["kl_coef"]
+    # seed maps 1:1 onto GRPOConfig.seed (TrainingArguments.seed in TRL 1.7.1).
+    # Omitted, TRL's default (42) applies, which is also the API default. The
+    # control plane rejects the GRPO knobs TRL has no field for
+    # (global_batch_size, and max_prompt_length without use_unsloth).
+    if "seed" in grpo_params and "seed" in hyperparameters:
+        config_kwargs["seed"] = hyperparameters["seed"]
     # Base path generates via transformers. vLLM rollouts are an opt-in
     # optimization (trl 0.22.2 + vllm 0.15.1 aren't directly compatible), so default
     # use_vllm off; a user with a compatible setup can flip it via hyperparameters.
