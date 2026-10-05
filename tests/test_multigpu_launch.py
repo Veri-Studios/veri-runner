@@ -1163,6 +1163,40 @@ def test_child_entrypoint_two_ranks_on_cpu(tmp_path):
     final = Path(result["checkpoint_dir"])
     assert (final / "config.json").exists() and (final / "tokenizer_config.json").exists()
 
+    # --preflight: the collective group comes up, every rank leaves an ok file
+    argv = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        "2",
+        "--max_restarts",
+        "0",
+        "--log_dir",
+        str(ranks),
+        "--rdzv-id",
+        "cpu2pf",
+        rt.__file__,
+        "--child-config",
+        str(child_path),
+        "--preflight",
+    ]
+    env = build_child_env(job, plan, ranks_dir=str(ranks), cpu_count=4, base_env=dict(os.environ))
+    env.update(
+        {
+            "ACCELERATE_USE_CPU": "true",
+            "ACCELERATE_TORCH_DEVICE": "cpu",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+            "HF_HUB_OFFLINE": "1",
+        }
+    )
+    pf = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
+    assert pf.returncode == 0, pf.stderr[-2000:]
+    files = sorted(ranks.glob("preflight_*.json"))
+    assert [p.name for p in files] == ["preflight_0.json", "preflight_1.json"]
+    bodies = [json.loads(p.read_text()) for p in files]
+    assert all(b["ok"] for b in bodies) and [b["all_reduce"] for b in bodies] == [2.0, 2.0]
+
     # rank 1 blows up before training: non-zero exit and torchelastic's error
     # file names rank 1 with the injected message
     bad = _run({"VERI_CHILD_FAIL_RANK": "1"})

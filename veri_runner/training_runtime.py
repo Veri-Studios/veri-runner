@@ -2853,18 +2853,76 @@ def _install_stack_dump(ranks_dir: str, rank: int) -> None:
     faulthandler.register(signal.SIGUSR1, file=_STACK_DUMP_FILE, all_threads=True)
 
 
+def _preflight_main(child: dict[str, Any], rank: int, ranks_dir: str) -> int:
+    """P2 (10.2): the job's own launcher brings up the collective group once
+    before any weights are downloaded: init, all_reduce(ones) == W, a short
+    matmul per GPU, free memory after the barrier. Each rank writes
+    ranks_dir/preflight_<rank>.json; the parent fails hardware_error on any
+    rank that cannot. ~20 s."""
+    import torch
+    import torch.distributed as dist
+
+    out: dict[str, Any] = {"rank": rank, "ok": False}
+    try:
+        from accelerate import PartialState
+
+        # same group the Trainer will build (ACCELERATE_USE_CPU selects gloo on
+        # a CPU-only host; production ranks are NCCL on CUDA)
+        state = PartialState(cpu=os.environ.get("ACCELERATE_USE_CPU", "").lower() == "true")
+        device = state.device
+        world = state.num_processes
+        t = torch.ones(1, device=device)
+        dist.all_reduce(t)
+        out["all_reduce"] = float(t.item())
+        if int(round(float(t.item()))) != world:
+            raise RuntimeError(f"all_reduce(ones) = {t.item()} != world size {world}")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            free, total = torch.cuda.mem_get_info()
+            out["memory_free_after_init"] = int(free)
+            out["memory_total"] = int(total)
+            out["nccl_version"] = list(torch.cuda.nccl.version())
+            n = 4096
+            a = torch.randn(n, n, device=device, dtype=torch.bfloat16)
+            b = torch.randn(n, n, device=device, dtype=torch.bfloat16)
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(5):
+                c = a @ b
+            torch.cuda.synchronize()
+            dt = time.time() - t0
+            out["matmul_tflops"] = round(5 * 2 * n**3 / dt / 1e12, 1)
+            del a, b, c
+        # a second collective as the barrier (dist.barrier picks a device on
+        # its own and fails on gloo-only hosts)
+        dist.all_reduce(torch.zeros(1, device=device))
+        out["ok"] = True
+    except Exception as e:  # noqa: BLE001 -- the parent reads the file
+        out["error"] = f"{type(e).__name__}: {e}"
+    with open(Path(ranks_dir) / f"preflight_{rank}.json", "w") as f:
+        json.dump(out, f)
+    _destroy_process_group()
+    if not out["ok"]:
+        raise RuntimeError(f"preflight failed on rank {rank}: {out.get('error')}")
+    return 0
+
+
 def _child_main(argv: list[str] | None = None) -> int:
     """One rank of a managed multi-GPU job (launched by the worker parent)."""
     import argparse
 
     parser = argparse.ArgumentParser(prog="training_runtime")
     parser.add_argument("--child-config", required=True)
+    parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args(argv)
     with open(args.child_config) as f:
         child = json.load(f)
     job_config, plan = child["job_config"], child["plan"]
     rank = _rank()
     ranks_dir = child.get("ranks_dir") or str(Path(args.child_config).parent / "ranks")
+    if args.preflight:
+        os.makedirs(ranks_dir, exist_ok=True)
+        return _preflight_main(child, rank, ranks_dir)
     _install_stack_dump(ranks_dir, rank)
     logging.basicConfig(
         level=logging.INFO, format=f"[rank {rank}] %(asctime)s %(levelname)s %(message)s"
