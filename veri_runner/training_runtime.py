@@ -584,8 +584,18 @@ def build_sft_config_kwargs(
     _apply_batch_knobs(config_kwargs, hyperparameters, launch_plan)
     if hyperparameters.get("max_steps"):
         config_kwargs["max_steps"] = hyperparameters["max_steps"]
+    packing = bool(hyperparameters.get("packing", False))
     if "packing" in sft_params:
-        config_kwargs["packing"] = bool(hyperparameters.get("packing", False))
+        config_kwargs["packing"] = packing
+    # Unsloth's SFTConfig defaults padding_free to None and its SFTTrainer turns
+    # None into True whenever packing is off (unsloth 2026.7.4 trainer.py:117-120).
+    # TRL 1.7.1's padding-free collator does not truncate, so SFTTrainer then
+    # rejects max_length (sft_trainer.py:1240). An explicit False keeps the
+    # collator truncating to max_length; it is TRL's own default, so the vanilla
+    # path is unchanged. Packing runs padding-free by design and sizes its
+    # blocks with max_length, so it is left alone.
+    if "padding_free" in sft_params and not packing:
+        config_kwargs["padding_free"] = False
     if "dataset_text_field" in sft_params:
         config_kwargs["dataset_text_field"] = hyperparameters.get("dataset_text_field", "text")
     # TRL renamed max_seq_length -> max_length; set whichever the version exposes.
@@ -950,7 +960,10 @@ def _load_model_and_tokenizer(
     use_unsloth = hyperparameters.get("use_unsloth", False)
     lora_rank = hyperparameters.get("lora_rank")
     load_in_4bit = hyperparameters.get("load_in_4bit", False)
-    max_seq_length = (
+    # Unsloth's SFTTrainer overwrites args.max_length with the model's
+    # max_seq_length (unsloth 2026.7.4 models/rl.py:1126-1170), so sft_text's
+    # max_seq_length must size the context or it is silently replaced.
+    max_seq_length = hyperparameters.get("max_seq_length") or (
         hyperparameters.get("max_prompt_length", 1024)
         + hyperparameters.get("max_response_length", 2048)
     )
