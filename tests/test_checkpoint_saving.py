@@ -475,8 +475,10 @@ def test_train_save_finalize_passes_the_resume_dir_to_trainer_train(tmp_path, mo
     class _Trainer:
         state = types.SimpleNamespace(global_step=100)
 
-        def train(self, resume_from_checkpoint=None):
-            seen["resume"] = resume_from_checkpoint
+        def train(self, **kw):
+            # A fresh run must call train() with NO kwargs (older adapters).
+            seen["resume"] = kw["resume_from_checkpoint"] if kw else None
+            seen["kwargs"] = kw
             return _Result()
 
         def save_model(self, d):
@@ -495,4 +497,4 @@ def test_train_save_finalize_passes_the_resume_dir_to_trainer_train(tmp_path, mo
     rt._train_save_finalize(trainer=_Trainer(), tokenizer=_Tok(), job_config={"job_id": "j2",
                             "checkpoint": {"local_output_root": str(tmp_path / "out")}},
                             wandb_enabled=False, log=logging.getLogger("t"))
-    assert seen["resume"] is None, "a fresh run passes None"
+    assert seen["resume"] is None and seen["kwargs"] == {}, "a fresh run calls train() bare"

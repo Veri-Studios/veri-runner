@@ -1500,7 +1500,11 @@ def _train_save_finalize(
     if resume_dir:
         log.info("Resuming from checkpoint %s", resume_dir)
     t0 = time.time()
-    train_result = trainer.train(resume_from_checkpoint=resume_dir)
+    # A fresh run calls train() exactly as before (adapters and test doubles
+    # that only know the old signature keep working).
+    train_result = (
+        trainer.train(resume_from_checkpoint=resume_dir) if resume_dir else trainer.train()
+    )
     train_time = time.time() - t0
     log.info("Training completed in %.1fs, loss=%.4f", train_time, train_result.training_loss)
 
