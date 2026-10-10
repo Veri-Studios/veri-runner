@@ -431,6 +431,90 @@ def test_build_sft_config_kwargs_omits_unsupported_and_uses_legacy_seq_len():
     assert "max_length" not in kwargs
 
 
+# Unsloth 2026.7.4 swaps in an SFTConfig whose padding_free defaults to None and,
+# on every non-packing SFTTrainer, turns None into True (unsloth/trainer.py:117-120,
+# 781-790). TRL 1.7.1 then refuses any max_length without packing
+# (sft_trainer.py:1240): prod job 27af5da0c37a. An explicit False is the opt-out
+# Unsloth honours, and keeps the collator truncating to max_length.
+class _UnslothLikeSFTConfig:
+    def __init__(self, packing=None, max_length=None, padding_free=None, max_seq_length=None):
+        pass
+
+
+def test_build_sft_config_kwargs_pins_padding_free_off_without_packing():
+    unpacked = build_sft_config_kwargs(
+        job_id="j",
+        hyperparameters={"use_unsloth": True, "max_seq_length": 2048},
+        sft_config_cls=_UnslothLikeSFTConfig,
+    )
+    assert unpacked["padding_free"] is False
+    assert unpacked["max_length"] == 2048
+
+    # Packing keeps padding_free unset: TRL's bfd packing runs padding-free and
+    # sizes the packed blocks with max_length itself.
+    packed = build_sft_config_kwargs(
+        job_id="j",
+        hyperparameters={"use_unsloth": True, "packing": True},
+        sft_config_cls=_UnslothLikeSFTConfig,
+    )
+    assert packed["packing"] is True
+    assert "padding_free" not in packed
+
+
+def test_sft_trainer_builds_and_truncates_under_unsloth_padding_free_rule(tmp_path):
+    # Real TRL (the fleet pins trl==1.7.1); skipped where the training stack is absent.
+    pytest.importorskip("trl")
+    pytest.importorskip("tokenizers")
+    from dataclasses import dataclass
+
+    from datasets import Dataset
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
+    from trl import SFTConfig, SFTTrainer
+
+    @dataclass
+    class UnslothSFTConfig(SFTConfig):  # unsloth/models/rl.py:1344, 1404-1409
+        padding_free: bool | None = None
+        max_seq_length: int | None = None
+
+    def unsloth_auto_padding_free(config):  # unsloth/trainer.py:117-120, 781-790
+        if not config.packing and config.padding_free is None:
+            config.padding_free = True
+            config.remove_unused_columns = False
+
+    words = [f"w{i}" for i in range(40)]
+    vocab = {"<pad>": 0, "<eos>": 1, "<unk>": 2, **{w: i + 3 for i, w in enumerate(words)}}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
+    )
+    model = Qwen2ForCausalLM(Qwen2Config(
+        vocab_size=len(vocab), hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=512,
+    ))
+
+    # The prod job's knobs, plus a max_seq_length shorter than the long row.
+    hp = {
+        "use_unsloth": True, "lora_rank": 32, "load_in_4bit": True,
+        "max_steps": 10, "max_seq_length": 64,
+    }
+    config = UnslothSFTConfig(**build_sft_config_kwargs(
+        job_id="j", hyperparameters=hp, sft_config_cls=UnslothSFTConfig,
+        output_root=str(tmp_path),
+    ))
+    unsloth_auto_padding_free(config)
+
+    long_row = {"text": " ".join(words * 5)}  # 200 words, far past max_seq_length
+    trainer = SFTTrainer(
+        model=model, args=config, processing_class=tokenizer,
+        train_dataset=Dataset.from_list([long_row, {"text": "w1 w2 w3"}]),
+    )
+    assert trainer.padding_free is False
+    batch = trainer.data_collator([trainer.train_dataset[0]])
+    assert tuple(batch["input_ids"].shape) == (1, 64)
+
+
 class _ChatTemplateTok:
     """Mimics tokenizer.apply_chat_template with a deterministic rendering."""
 
@@ -937,6 +1021,22 @@ def test_load_model_unsloth_with_lora(monkeypatch):
     assert fake.from_pretrained_calls[0]["full_finetuning"] is False
     assert fake.get_peft_model_calls[0]["r"] == 32
     assert fake.get_peft_model_calls[0]["lora_alpha"] == 64
+
+
+def test_load_model_unsloth_context_follows_sft_max_seq_length(monkeypatch):
+    # Unsloth's SFTTrainer overwrites args.max_length with model.max_seq_length
+    # (unsloth/models/rl.py:1126-1170), so the context sized here IS the
+    # truncation length: an sft_text max_seq_length must size it.
+    fake = _FakeUnsloth()
+    import types
+
+    mock_mod = types.ModuleType("unsloth")
+    mock_mod.FastLanguageModel = fake
+    monkeypatch.setitem(__import__("sys").modules, "unsloth", mock_mod)
+
+    hp = {**_BASE_HP, "use_unsloth": True, "lora_rank": 32, "max_seq_length": 4096}
+    _load_model_and_tokenizer("Qwen/Qwen3-4B", hp, logging.getLogger())
+    assert fake.from_pretrained_calls[0]["max_seq_length"] == 4096
 
 
 def test_load_model_unsloth_fallback_on_import_error(monkeypatch):

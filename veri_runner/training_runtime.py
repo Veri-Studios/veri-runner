@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -445,8 +446,30 @@ def build_grpo_config_kwargs(
     # VS-393: periodic saving, filtered to what the installed TRL accepts
     # (same drift adaptation as the knobs above).
     config_kwargs.update(build_save_kwargs(checkpoint, grpo_params))
+    # C2: GRPO buffers steps_per_generation x num_iterations optimizer steps
+    # of rollouts and does not checkpoint them (TRL regenerates after a
+    # resume). A step-count cadence that lands on a generation boundary makes
+    # the resumed run identical to an uninterrupted one; a fraction (HF
+    # resolves it at train time) is left alone.
+    save_steps = config_kwargs.get("save_steps")
+    if isinstance(save_steps, int) and not isinstance(save_steps, bool) and save_steps > 0:
+        config_kwargs["save_steps"] = grpo_aligned_save_steps(save_steps, hyperparameters)
 
     return config_kwargs
+
+
+def grpo_aligned_save_steps(save_steps: int, hyperparameters: Mapping[str, Any]) -> int:
+    """Round a GRPO step-count cadence UP to a multiple of
+    steps_per_generation x num_iterations (TRL defaults: gradient
+    accumulation steps, 1)."""
+    spg = int(
+        hyperparameters.get("steps_per_generation")
+        or hyperparameters.get("gradient_accumulation_steps")
+        or 1
+    )
+    iters = int(hyperparameters.get("num_iterations") or 1)
+    period = max(1, spg * iters)
+    return ((save_steps + period - 1) // period) * period
 
 
 def build_trainer_kwargs(
@@ -584,8 +607,18 @@ def build_sft_config_kwargs(
     _apply_batch_knobs(config_kwargs, hyperparameters, launch_plan)
     if hyperparameters.get("max_steps"):
         config_kwargs["max_steps"] = hyperparameters["max_steps"]
+    packing = bool(hyperparameters.get("packing", False))
     if "packing" in sft_params:
-        config_kwargs["packing"] = bool(hyperparameters.get("packing", False))
+        config_kwargs["packing"] = packing
+    # Unsloth's SFTConfig defaults padding_free to None and its SFTTrainer turns
+    # None into True whenever packing is off (unsloth 2026.7.4 trainer.py:117-120).
+    # TRL 1.7.1's padding-free collator does not truncate, so SFTTrainer then
+    # rejects max_length (sft_trainer.py:1240). An explicit False keeps the
+    # collator truncating to max_length; it is TRL's own default, so the vanilla
+    # path is unchanged. Packing runs padding-free by design and sizes its
+    # blocks with max_length, so it is left alone.
+    if "padding_free" in sft_params and not packing:
+        config_kwargs["padding_free"] = False
     if "dataset_text_field" in sft_params:
         config_kwargs["dataset_text_field"] = hyperparameters.get("dataset_text_field", "text")
     # TRL renamed max_seq_length -> max_length; set whichever the version exposes.
@@ -665,6 +698,21 @@ def build_dpo_config_kwargs(
     config_kwargs.update(build_save_kwargs(checkpoint, dpo_params))
 
     return config_kwargs
+
+
+def resume_checkpoint_dir(job_config: dict[str, Any]) -> str | None:
+    """C2: the local directory of the downloaded source checkpoint, or None.
+    Only a directory that holds trainer_state.json counts: resuming from a
+    partial download would raise deep inside the Trainer."""
+    resume = job_config.get("resume") or {}
+    local_dir = resume.get("local_dir")
+    if not local_dir:
+        return None
+    if not (Path(local_dir) / "trainer_state.json").is_file():
+        raise ValueError(
+            f"resume: {local_dir} is not a complete checkpoint (no trainer_state.json)"
+        )
+    return str(local_dir)
 
 
 def checkpoint_output_root(job_config: dict[str, Any]) -> str:
@@ -950,7 +998,10 @@ def _load_model_and_tokenizer(
     use_unsloth = hyperparameters.get("use_unsloth", False)
     lora_rank = hyperparameters.get("lora_rank")
     load_in_4bit = hyperparameters.get("load_in_4bit", False)
-    max_seq_length = (
+    # Unsloth's SFTTrainer overwrites args.max_length with the model's
+    # max_seq_length (unsloth 2026.7.4 models/rl.py:1126-1170), so sft_text's
+    # max_seq_length must size the context or it is silently replaced.
+    max_seq_length = hyperparameters.get("max_seq_length") or (
         hyperparameters.get("max_prompt_length", 1024)
         + hyperparameters.get("max_response_length", 2048)
     )
@@ -1179,27 +1230,145 @@ def _attach_progress_callback(
     trainer.add_callback(_ProgressCallback())
 
 
+def stage_checkpoint(src: Path, stage_root: Path, step: int) -> Path:
+    """Hard-link `src` (checkpoint-N) into `{stage_root}/step-N` and return it.
+
+    HF Trainer writes checkpoint-N, deletes checkpoint-(N-1)
+    (save_total_limit=1) and only THEN fires on_save, so an upload reading
+    checkpoint-(N-1) was racing an rmtree. A hard-linked copy keeps the bytes
+    alive after the Trainer unlinks its names (verified: exp1_save_rotate,
+    transformers 4.56.2) at no disk cost; a filesystem that refuses the link
+    (EXDEV) gets a real copy instead.
+    """
+    dst = stage_root / f"step-{step}"
+    if dst.exists():
+        shutil.rmtree(dst)
+    for p in src.rglob("*"):
+        rel = p.relative_to(src)
+        if p.is_dir():
+            (dst / rel).mkdir(parents=True, exist_ok=True)
+            continue
+        (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(p, dst / rel)
+        except OSError:
+            shutil.copy2(p, dst / rel)
+    return dst
+
+
+class CheckpointUploadQueue:
+    """Uploads staged checkpoints in the background: one in flight, one
+    pending (the newest), never abandoning the in-flight upload.
+
+    The old policy ("newest wins", abandon the in-flight upload) combined with
+    HF's rotation meant a slow uplink committed NOTHING: every upload was
+    superseded before it finished and its source directory was deleted under
+    it. Now the in-flight upload always completes (its staged copy is safe),
+    a newer save waits as the single pending one, and a save that arrives
+    while one is already pending replaces it (its staged copy is deleted and
+    `checkpoint_upload_skipped` is reported). Disk: at most three checkpoints
+    of bytes (the Trainer's live one + in-flight + pending), which the disk
+    guard below budgets for.
+
+    Shared by the Trainer callback (on_save) and the worker's directory
+    watchers (multi-GPU launcher, custom scripts), so the three paths cannot
+    drift.
+    """
+
+    def __init__(self, upload_fn, log, event_fn=None, join_timeout_s: float = 600.0):
+        self._upload_fn = upload_fn
+        self._log = log
+        self._event_fn = event_fn
+        self._join_timeout_s = join_timeout_s
+        self._lock = threading.Lock()
+        self._in_flight: tuple[int, Path, threading.Thread] | None = None
+        self._pending: tuple[int, Path] | None = None
+        self.committed: list[int] = []
+        self.skipped: list[int] = []
+
+    def submit(self, step: int, staged_dir: Path) -> None:
+        with self._lock:
+            if self._in_flight is None or not self._in_flight[2].is_alive():
+                self._start(step, staged_dir)
+                return
+            if self._pending is not None:
+                old_step, old_dir = self._pending
+                shutil.rmtree(old_dir, ignore_errors=True)
+                self.skipped.append(old_step)
+                self._log.warning(
+                    "checkpoint step-%s skipped: step-%s is still uploading and step-%s is newer",
+                    old_step, self._in_flight[0], step,
+                )
+                self._emit(
+                    "checkpoint_upload_skipped",
+                    f"checkpoint step-{old_step} was not uploaded: step-{self._in_flight[0]} "
+                    f"was still uploading when step-{step} was saved (slow uplink)",
+                    {"step": old_step, "in_flight_step": self._in_flight[0], "newer_step": step},
+                    level="warning",
+                )
+            self._pending = (step, staged_dir)
+
+    def _start(self, step: int, staged_dir: Path) -> None:
+        """Caller holds the lock."""
+
+        def _run():
+            try:
+                self._upload_fn(str(staged_dir), step)
+                self.committed.append(step)
+            except Exception as e:  # noqa: BLE001
+                # Never fail the RUN over an upload: the training loop is the
+                # expensive part and the next save gets another chance. The
+                # control plane simply has no ready row for this step.
+                self._log.warning("checkpoint step-%s upload failed: %s", step, e)
+            finally:
+                shutil.rmtree(staged_dir, ignore_errors=True)
+                with self._lock:
+                    self._in_flight = None
+                    if self._pending is not None:
+                        nxt_step, nxt_dir = self._pending
+                        self._pending = None
+                        self._start(nxt_step, nxt_dir)
+
+        t = threading.Thread(target=_run, name=f"ckpt-upload-{step}", daemon=True)
+        self._in_flight = (step, staged_dir, t)
+        t.start()
+
+    def _emit(self, event_type, message, metadata, level="info"):
+        if self._event_fn is None:
+            return
+        try:
+            self._event_fn(event_type, message, {**metadata, "level": level})
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("event %s not reported: %s", event_type, e)
+
+    def join(self, timeout_s: float | None = None) -> None:
+        """Wait for the in-flight upload and then the pending one (bounded
+        each). Without this the daemon threads die at interpreter exit and the
+        newest checkpoint, the one a resume wants, is the one that goes
+        missing."""
+        budget = self._join_timeout_s if timeout_s is None else timeout_s
+        for _ in range(2):
+            with self._lock:
+                t = self._in_flight[2] if self._in_flight else None
+            if t is None:
+                return
+            t.join(timeout=budget)
+
+
 def _attach_checkpoint_uploader(
     trainer: Any,
     job_config: dict[str, Any],
     upload_fn: Callable[[str, int], None] | None,
     log: logging.Logger,
+    event_fn: Callable[[str, str, dict], None] | None = None,
 ) -> None:
     """Upload each periodic checkpoint off the training thread (VS-393).
 
     Registered only when the control plane enabled checkpointing AND the adapter
-    supplied an upload_fn, so with the feature flag dark this is a no-op.
-
-    Three properties, each deliberate:
-
-    * BACKGROUND. A save is 24-40 GB for a full fine-tune; uploading it inline
-      would stall the training loop for minutes per save.
-    * NEWEST-WINS. If step N+1 lands while step N is still uploading, N is
-      abandoned. A queue would let a slow uplink fill a 120 GB root volume, and
-      the newest checkpoint is the only one a resume wants anyway.
-    * DELETE-AFTER-UPLOAD is NOT done here. HF's own save_total_limit owns local
-      rotation; deleting a directory the Trainer still tracks would corrupt its
-      state. Local retention is bounded by save_total_limit=1 instead.
+    supplied an upload_fn, so with the feature flag dark this is a no-op. At
+    on_save the fresh checkpoint-N is hard-linked into {output_dir}/.upload/
+    (stage_checkpoint) and handed to a CheckpointUploadQueue; HF's own
+    save_total_limit keeps owning the Trainer's directory.
     """
     checkpoint_cfg = job_config.get("checkpoint") or {}
     if not checkpoint_cfg.get("enabled") or not upload_fn:
@@ -1207,12 +1376,11 @@ def _attach_checkpoint_uploader(
 
     from transformers import TrainerCallback
 
+    queue = CheckpointUploadQueue(upload_fn, log, event_fn=event_fn)
+
     class _CheckpointUploadCallback(TrainerCallback):
         def __init__(self) -> None:
-            self._thread: threading.Thread | None = None
-            # Set to ask an in-flight upload to stop being waited on; the upload
-            # itself is not interruptible, so "abandon" means "stop caring".
-            self._superseded = threading.Event()
+            self.queue = queue
 
         def on_save(self, args, state, control, **kwargs):
             step = int(getattr(state, "global_step", 0) or 0)
@@ -1220,44 +1388,98 @@ def _attach_checkpoint_uploader(
             if not ckpt_dir.exists():
                 log.warning("on_save fired but %s is missing; skipping", ckpt_dir)
                 return
-
-            if self._thread is not None and self._thread.is_alive():
-                log.info(
-                    "checkpoint step-%s superseded an in-flight upload; newest wins",
-                    step,
-                )
-                self._superseded.set()
-
-            self._superseded = threading.Event()
-            mine = self._superseded
-
-            def _run():
-                try:
-                    upload_fn(str(ckpt_dir), step)
-                except Exception as e:  # noqa: BLE001
-                    # Never fail the RUN over an upload: the training loop is the
-                    # expensive part and the next save gets another chance. The
-                    # control plane simply has no ready row for this step, which
-                    # is the correct outcome for a failed upload.
-                    if mine.is_set():
-                        log.info("abandoned upload of step-%s: %s", step, e)
-                    else:
-                        log.warning("checkpoint step-%s upload failed: %s", step, e)
-
-            self._thread = threading.Thread(
-                target=_run, name=f"ckpt-upload-{step}", daemon=True
-            )
-            self._thread.start()
+            staged = stage_checkpoint(ckpt_dir, Path(args.output_dir) / ".upload", step)
+            queue.submit(step, staged)
 
         def on_train_end(self, args, state, control, **kwargs):
-            # Give the last upload a bounded chance to finish. Without this the
-            # daemon thread dies at interpreter exit and the most valuable
-            # checkpoint -- the newest -- is the one that goes missing.
-            if self._thread is not None and self._thread.is_alive():
-                log.info("waiting up to 10m for the final checkpoint upload")
-                self._thread.join(timeout=600)
+            log.info("waiting for the last checkpoint uploads to finish")
+            queue.join()
 
     trainer.add_callback(_CheckpointUploadCallback())
+
+
+# ---- C0 disk guard ----
+
+# Bytes per parameter of a resumable checkpoint, as HF/TRL write it with the
+# model loaded in bf16: weights 2 + AdamW exp_avg/exp_avg_sq in the parameter
+# dtype 4 (= 6N); a FULL_STATE_DICT FSDP save adds pytorch_model_fsdp.bin
+# (2N). An adapter run saves only the trainable (LoRA) parameters: bf16 weights
+# plus fp32 Adam state, about 10 bytes each.
+CHECKPOINT_BYTES_PER_PARAM_FULL = 6
+CHECKPOINT_BYTES_PER_PARAM_FSDP_EXTRA = 2
+CHECKPOINT_BYTES_PER_TRAINABLE_PARAM_ADAPTER = 10
+# The queue keeps up to two staged copies next to the Trainer's live one.
+CHECKPOINT_DISK_COPIES = 3
+
+
+def estimate_checkpoint_bytes(model: Any, fsdp: bool = False) -> int:
+    """Resumable checkpoint size from the loaded model's parameter counts."""
+    total = 0
+    trainable = 0
+    for p in model.parameters():
+        n = int(p.numel())
+        total += n
+        if getattr(p, "requires_grad", False):
+            trainable += n
+    if trainable and trainable < total:
+        return CHECKPOINT_BYTES_PER_TRAINABLE_PARAM_ADAPTER * trainable
+    per_param = CHECKPOINT_BYTES_PER_PARAM_FULL + (
+        CHECKPOINT_BYTES_PER_PARAM_FSDP_EXTRA if fsdp else 0
+    )
+    return per_param * total
+
+
+def apply_checkpoint_disk_guard(
+    checkpoint: dict[str, Any] | None,
+    model: Any,
+    output_root: str,
+    log: logging.Logger,
+    event_fn: Callable[[str, str, dict], None] | None = None,
+    launch_plan: dict[str, Any] | None = None,
+    free_bytes: int | None = None,
+) -> dict[str, Any] | None:
+    """Turn periodic saves off when three checkpoints would not fit on the box.
+
+    Peak local use is the Trainer's live checkpoint plus the queue's in-flight
+    and pending staged copies. The budget is the smaller of what df reports
+    for `output_root` and the control plane's per-provider `local_disk_gb`
+    hint (a container's df can lie). Disabling is loud: a log line and a
+    `checkpoint_disabled_disk` job event with the numbers. The final artifact
+    is unaffected.
+    """
+    if not checkpoint or not checkpoint.get("enabled"):
+        return checkpoint
+    fsdp = bool(launch_plan) and str(launch_plan.get("backend", "")).startswith("fsdp")
+    need = CHECKPOINT_DISK_COPIES * estimate_checkpoint_bytes(model, fsdp=fsdp)
+    if free_bytes is None:
+        os.makedirs(output_root, exist_ok=True)
+        free_bytes = shutil.disk_usage(output_root).free
+    hint_gb = checkpoint.get("local_disk_gb")
+    if hint_gb:
+        free_bytes = min(free_bytes, int(hint_gb) * 10**9)
+    if need <= free_bytes:
+        return checkpoint
+    message = (
+        f"intermediate checkpoints disabled: {CHECKPOINT_DISK_COPIES} x "
+        f"{need / CHECKPOINT_DISK_COPIES / 1e9:.1f} GB per checkpoint exceeds "
+        f"{free_bytes / 1e9:.1f} GB of local disk; the final artifact is still saved"
+    )
+    log.warning(message)
+    if event_fn is not None:
+        try:
+            event_fn(
+                "checkpoint_disabled_disk",
+                message,
+                {
+                    "checkpoint_bytes": need // CHECKPOINT_DISK_COPIES,
+                    "copies": CHECKPOINT_DISK_COPIES,
+                    "free_bytes": free_bytes,
+                    "level": "warning",
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("checkpoint_disabled_disk event not reported: %s", e)
+    return {"enabled": False, "save_strategy": "no", "disabled_reason": "disk"}
 
 
 def _train_save_finalize(
@@ -1273,6 +1495,12 @@ def _train_save_finalize(
     """The shared tail of every TRL method: train, save the checkpoint, build
     the result dict, and capture/finish the W&B run if one is live.
 
+    C2: `job_config["resume"]["local_dir"]` (set by the worker after it
+    downloaded the source checkpoint) is handed to
+    `trainer.train(resume_from_checkpoint=...)`, which restores the model,
+    optimizer, scheduler, RNG and global_step and skips the data already seen
+    (verified for SFT, DPO and GRPO on TRL 1.7.1). A fresh run passes None.
+
     Under the multi-GPU launcher (VS-476) every rank trains and takes part in
     the (collective) final save; rank 0 alone writes the tokenizer and owns the
     result, and nobody pushes to the Hub: the parent does that from the saved
@@ -1281,8 +1509,15 @@ def _train_save_finalize(
     distributed = bool(launch_plan) and int(launch_plan.get("world_size", 1)) > 1
     if distributed:
         _force_fp32_grad_reduce(trainer, launch_plan)
+    resume_dir = resume_checkpoint_dir(job_config)
+    if resume_dir:
+        log.info("Resuming from checkpoint %s", resume_dir)
     t0 = time.time()
-    train_result = trainer.train()
+    # A fresh run calls train() exactly as before (adapters and test doubles
+    # that only know the old signature keep working).
+    train_result = (
+        trainer.train(resume_from_checkpoint=resume_dir) if resume_dir else trainer.train()
+    )
     train_time = time.time() - t0
     log.info("Training completed in %.1fs, loss=%.4f", train_time, train_result.training_loss)
 
@@ -1355,6 +1590,8 @@ def run_grpo_training(
     # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
     # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
+    # C0: job events (type, message, metadata) -> the control plane.
+    event_fn: Callable[[str, str, dict], None] | None = None,
 ) -> dict[str, Any]:
     """Run shared GRPO training semantics for a concrete runner adapter."""
     log = logger or logging.getLogger("veri.training_runtime")
@@ -1402,6 +1639,9 @@ def run_grpo_training(
     log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
+    job_config["checkpoint"] = apply_checkpoint_disk_guard(
+        job_config.get("checkpoint"), model, checkpoint_output_root(job_config), log, event_fn
+    )
 
     training_args = GRPOConfig(
         **build_grpo_config_kwargs(
@@ -1426,7 +1666,7 @@ def run_grpo_training(
     )
 
     _attach_progress_callback(trainer, progress_fn)
-    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
         tokenizer=tokenizer,
@@ -1673,6 +1913,7 @@ def run_grpo_harness_training(
     # VS-393: upload one finished checkpoint dir (dir, step). Supplied by the
     # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
+    event_fn: Callable[[str, str, dict], None] | None = None,
 ) -> dict[str, Any]:
     """Harness-in-the-loop GRPO: the user's unmodified agent harness
     drives multi-turn rollouts against the in-training policy.
@@ -1787,6 +2028,9 @@ def run_grpo_harness_training(
     t0 = time.time()
     model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
     log.info("Model loaded in %.1fs", time.time() - t0)
+    job_config["checkpoint"] = apply_checkpoint_disk_guard(
+        job_config.get("checkpoint"), model, checkpoint_output_root(job_config), log, event_fn
+    )
 
     trajectory_root = str(Path(checkpoint_output_root(job_config)) / job_id / "trajectories")
     span_store = SpanStore(str(Path(trajectory_root) / "spans"))
@@ -1889,7 +2133,7 @@ def run_grpo_harness_training(
     trainer = GRPOTrainer(**trainer_kwargs)
 
     _attach_progress_callback(trainer, progress_fn)
-    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     try:
         return _train_save_finalize(
             trainer=trainer,
@@ -1946,6 +2190,7 @@ def run_sft_text_training(
     # VS-476: multi-GPU child: the resolved plan + the rank-0 phase writer.
     launch_plan: dict[str, Any] | None = None,
     phase_fn: Callable[[str, int], None] | None = None,
+    event_fn: Callable[[str, str, dict], None] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Supervised fine-tuning on text via TRL SFTTrainer.
@@ -1989,6 +2234,10 @@ def run_sft_text_training(
     log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
+    job_config["checkpoint"] = apply_checkpoint_disk_guard(
+        job_config.get("checkpoint"), model, checkpoint_output_root(job_config), log, event_fn,
+        launch_plan=launch_plan,
+    )
 
     text_field = hyperparameters.get("dataset_text_field", "text")
     rendered = prerender_chat_template_rows(
@@ -2023,7 +2272,7 @@ def run_sft_text_training(
     )
 
     _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
-    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
         tokenizer=tokenizer,
@@ -2070,6 +2319,7 @@ def run_dpo_training(
     # VS-476: multi-GPU child: the resolved plan + the rank-0 phase writer.
     launch_plan: dict[str, Any] | None = None,
     phase_fn: Callable[[str, int], None] | None = None,
+    event_fn: Callable[[str, str, dict], None] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Direct Preference Optimization via TRL DPOTrainer.
@@ -2115,6 +2365,10 @@ def run_dpo_training(
     log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
+    job_config["checkpoint"] = apply_checkpoint_disk_guard(
+        job_config.get("checkpoint"), model, checkpoint_output_root(job_config), log, event_fn,
+        launch_plan=launch_plan,
+    )
 
     training_args = DPOConfig(
         **build_dpo_config_kwargs(
@@ -2138,7 +2392,7 @@ def run_dpo_training(
     )
 
     _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
-    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log)
+    _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
         tokenizer=tokenizer,
@@ -2338,6 +2592,9 @@ CHECKPOINT_WRITE_BYTES_PER_S = 100 * 10**6
 _CHILD_CONFIG_ALLOW = (
     "job_id", "method", "base_model", "hyperparameters", "checkpoint", "output_name",
     "wandb_project", "gpu_count", "gpu_type", "provider", "num_nodes", "system_prompt",
+    # C2: {checkpoint_id, step, local_dir}; the manifest URL is harmless but the
+    # parent already downloaded the files, so the ranks only need local_dir.
+    "resume",
 )
 
 
@@ -2778,6 +3035,12 @@ class RankZeroProgressFile:
     def phase(self, phase: str, step: int) -> None:
         self._write({"phase": phase, "step": int(step)})
 
+    def event(self, event_type: str, message: str, metadata: dict[str, Any]) -> None:
+        """C0: a job event raised inside a rank (checkpoint_disabled_disk,
+        checkpoint_upload_skipped); the parent forwards it to the control
+        plane with the worker's callback token."""
+        self._write({"event": event_type, "message": message, "metadata": metadata})
+
 
 def _rank() -> int:
     return int(os.environ.get("RANK", "0"))
@@ -2955,6 +3218,7 @@ def _child_main(argv: list[str] | None = None) -> int:
         logger=log,
         progress_fn=progress.step if progress else None,
         phase_fn=progress.phase if progress else None,
+        event_fn=progress.event if progress else None,
         launch_plan=plan,
     )
     if rank == 0 and child.get("result_path"):
