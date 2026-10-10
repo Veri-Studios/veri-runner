@@ -690,6 +690,21 @@ def build_dpo_config_kwargs(
     return config_kwargs
 
 
+def resume_checkpoint_dir(job_config: dict[str, Any]) -> str | None:
+    """C2: the local directory of the downloaded source checkpoint, or None.
+    Only a directory that holds trainer_state.json counts: resuming from a
+    partial download would raise deep inside the Trainer."""
+    resume = job_config.get("resume") or {}
+    local_dir = resume.get("local_dir")
+    if not local_dir:
+        return None
+    if not (Path(local_dir) / "trainer_state.json").is_file():
+        raise ValueError(
+            f"resume: {local_dir} is not a complete checkpoint (no trainer_state.json)"
+        )
+    return str(local_dir)
+
+
 def checkpoint_output_root(job_config: dict[str, Any]) -> str:
     """Return the runner local output root from structured checkpoint config."""
     checkpoint_config = job_config.get("checkpoint") or {}
@@ -1467,6 +1482,12 @@ def _train_save_finalize(
     """The shared tail of every TRL method: train, save the checkpoint, build
     the result dict, and capture/finish the W&B run if one is live.
 
+    C2: `job_config["resume"]["local_dir"]` (set by the worker after it
+    downloaded the source checkpoint) is handed to
+    `trainer.train(resume_from_checkpoint=...)`, which restores the model,
+    optimizer, scheduler, RNG and global_step and skips the data already seen
+    (verified for SFT, DPO and GRPO on TRL 1.7.1). A fresh run passes None.
+
     Under the multi-GPU launcher (VS-476) every rank trains and takes part in
     the (collective) final save; rank 0 alone writes the tokenizer and owns the
     result, and nobody pushes to the Hub: the parent does that from the saved
@@ -1475,8 +1496,11 @@ def _train_save_finalize(
     distributed = bool(launch_plan) and int(launch_plan.get("world_size", 1)) > 1
     if distributed:
         _force_fp32_grad_reduce(trainer, launch_plan)
+    resume_dir = resume_checkpoint_dir(job_config)
+    if resume_dir:
+        log.info("Resuming from checkpoint %s", resume_dir)
     t0 = time.time()
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=resume_dir)
     train_time = time.time() - t0
     log.info("Training completed in %.1fs, loss=%.4f", train_time, train_result.training_loss)
 
@@ -2551,6 +2575,9 @@ CHECKPOINT_WRITE_BYTES_PER_S = 100 * 10**6
 _CHILD_CONFIG_ALLOW = (
     "job_id", "method", "base_model", "hyperparameters", "checkpoint", "output_name",
     "wandb_project", "gpu_count", "gpu_type", "provider", "num_nodes", "system_prompt",
+    # C2: {checkpoint_id, step, local_dir}; the manifest URL is harmless but the
+    # parent already downloaded the files, so the ranks only need local_dir.
+    "resume",
 )
 
 

@@ -438,3 +438,61 @@ def test_rank_zero_progress_file_carries_events(tmp_path):
     assert records[1]["event"] == "checkpoint_disabled_disk"
     assert records[1]["metadata"] == {"free_bytes": 1, "level": "warning"}
     assert "step" not in records[1], "an event record is not a progress record"
+
+
+# ---- C2: resume ----
+
+
+def test_train_resumes_only_from_a_complete_downloaded_checkpoint(tmp_path):
+    """BAD: resume_from_checkpoint was never passed (the string did not exist
+    in the runner). GOOD: the worker's downloaded directory reaches
+    trainer.train(resume_from_checkpoint=...); a fresh run passes None; a
+    partial download (no trainer_state.json) is refused before training."""
+    from veri_runner.training_runtime import _CHILD_CONFIG_ALLOW, resume_checkpoint_dir
+
+    assert resume_checkpoint_dir({}) is None
+    assert resume_checkpoint_dir({"resume": {"checkpoint_id": "ckpt_x", "step": 40}}) is None
+    ck = tmp_path / "checkpoint-40"
+    ck.mkdir()
+    with pytest.raises(ValueError, match="not a complete checkpoint"):
+        resume_checkpoint_dir({"resume": {"local_dir": str(ck)}})
+    (ck / "trainer_state.json").write_text("{}")
+    assert resume_checkpoint_dir({"resume": {"local_dir": str(ck)}}) == str(ck)
+    assert "resume" in _CHILD_CONFIG_ALLOW, "the multi-GPU ranks need the local dir"
+
+
+def test_train_save_finalize_passes_the_resume_dir_to_trainer_train(tmp_path, monkeypatch):
+    from veri_runner import training_runtime as rt
+
+    ck = tmp_path / "checkpoint-40"
+    ck.mkdir()
+    (ck / "trainer_state.json").write_text("{}")
+    seen = {}
+
+    class _Result:
+        training_loss = 0.5
+
+    class _Trainer:
+        state = types.SimpleNamespace(global_step=100)
+
+        def train(self, resume_from_checkpoint=None):
+            seen["resume"] = resume_from_checkpoint
+            return _Result()
+
+        def save_model(self, d):
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+    class _Tok:
+        def save_pretrained(self, d):
+            pass
+
+    monkeypatch.setattr(rt, "push_to_hf_hub", lambda **kw: None)
+    cfg = {"job_id": "j", "checkpoint": {"local_output_root": str(tmp_path / "out")},
+           "resume": {"checkpoint_id": "ckpt_x", "step": 40, "local_dir": str(ck)}}
+    rt._train_save_finalize(trainer=_Trainer(), tokenizer=_Tok(), job_config=cfg,
+                            wandb_enabled=False, log=logging.getLogger("t"))
+    assert seen["resume"] == str(ck)
+    rt._train_save_finalize(trainer=_Trainer(), tokenizer=_Tok(), job_config={"job_id": "j2",
+                            "checkpoint": {"local_output_root": str(tmp_path / "out")}},
+                            wandb_enabled=False, log=logging.getLogger("t"))
+    assert seen["resume"] is None, "a fresh run passes None"
