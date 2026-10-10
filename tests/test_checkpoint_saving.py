@@ -9,10 +9,12 @@ off the box.
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -236,7 +238,9 @@ def test_a_save_uploads_off_the_training_thread(tmp_path):
     assert seen == [], "on_save must NOT have waited for the upload"
     release.set()
     cb.on_train_end(_Args(tmp_path), _State(100), None)
-    assert seen == [(str(tmp_path / "checkpoint-100"), 100)]
+    # C0: the upload reads the hard-linked STAGED copy, never the Trainer's
+    # own directory (which HF deletes on the next save).
+    assert seen == [(str(tmp_path / ".upload" / "step-100"), 100)]
 
 
 def test_the_final_upload_is_awaited_at_train_end(tmp_path):
@@ -271,28 +275,166 @@ def test_a_missing_checkpoint_dir_is_skipped_not_uploaded(tmp_path):
     assert calls == []
 
 
-def test_newest_wins_when_a_save_overtakes_an_in_flight_upload(tmp_path):
-    """A queue would let a slow uplink fill a 120 GB root volume, and the older
-    checkpoint is worthless to a resume once a newer one exists. So a new save
-    supersedes the in-flight upload rather than queueing behind it."""
+def test_one_upload_in_flight_one_pending_and_the_in_flight_one_is_never_abandoned(tmp_path):
+    """BAD (the old "newest wins" policy): a save that overtook an in-flight
+    upload abandoned it, and HF had already deleted its directory, so on a slow
+    uplink NO checkpoint ever committed. GOOD: the in-flight upload (100) always
+    finishes; the newest save is the single pending one; a save arriving while
+    one is pending replaces it and reports checkpoint_upload_skipped."""
     release = threading.Event()
     finished = []
+    events = []
 
     def upload(d, step):
         if step == 100:
             release.wait(5)
         finished.append(step)
 
-    cb = _uploader(_FakeTrainer(), tmp_path, upload)
-    _fire(cb, tmp_path, 100)
+    trainer = _FakeTrainer()
+    _attach_checkpoint_uploader(
+        trainer, {"checkpoint": {"enabled": True}}, upload, logging.getLogger("test"),
+        lambda t, m, meta: events.append((t, meta)),
+    )
+    cb = trainer.callbacks[0]
+    _fire(cb, tmp_path, 100)   # in flight, blocked
     time.sleep(0.05)
-    _fire(cb, tmp_path, 200)  # supersedes step 100
-
-    # Step 200 completes without waiting for 100.
-    for _ in range(50):
-        if 200 in finished:
-            break
-        time.sleep(0.02)
-    assert 200 in finished, "the newest checkpoint must not queue behind the older"
+    _fire(cb, tmp_path, 200)   # pending
+    _fire(cb, tmp_path, 300)   # replaces 200 as pending
+    time.sleep(0.05)
+    assert finished == [], "nothing finished while 100 is blocked; 300 waits, never overtakes"
+    assert [e[0] for e in events] == ["checkpoint_upload_skipped"]
+    assert events[0][1]["step"] == 200 and events[0][1]["newer_step"] == 300
+    assert not (tmp_path / ".upload" / "step-200").exists(), "the skipped stage is freed"
     release.set()
-    cb.on_train_end(_Args(tmp_path), _State(200), None)
+    cb.on_train_end(_Args(tmp_path), _State(300), None)
+    assert finished == [100, 300], "the in-flight upload completed, then the pending one"
+    assert cb.queue.skipped == [200]
+    assert not (tmp_path / ".upload" / "step-100").exists(), "stages are freed after upload"
+
+
+def test_the_staged_copy_survives_the_trainers_rotation(tmp_path):
+    """HF writes checkpoint-N, rmtree's N-1 and only then fires on_save, so an
+    upload reading the Trainer's directory raced a delete. The hard-linked
+    stage keeps the bytes readable after checkpoint-N itself is gone."""
+    import shutil
+
+    got = {}
+    release = threading.Event()
+
+    def upload(d, step):
+        release.wait(5)
+        got[step] = {p.name: p.read_bytes() for p in Path(d).rglob("*") if p.is_file()}
+
+    cb = _uploader(_FakeTrainer(), tmp_path, upload)
+    ck = tmp_path / "checkpoint-100"
+    ck.mkdir()
+    (ck / "optimizer.pt").write_bytes(b"o" * 1000)
+    (ck / "sub").mkdir()
+    (ck / "sub" / "model.safetensors").write_bytes(b"m" * 500)
+    cb.on_save(_Args(tmp_path), _State(100), None)
+    shutil.rmtree(ck)  # the Trainer's next save rotates checkpoint-100 away
+    release.set()
+    cb.on_train_end(_Args(tmp_path), _State(100), None)
+    assert got[100] == {"optimizer.pt": b"o" * 1000, "model.safetensors": b"m" * 500}
+
+
+# ---- C0 disk guard ----
+
+
+class _Param:
+    def __init__(self, n, requires_grad=True):
+        self._n = n
+        self.requires_grad = requires_grad
+
+    def numel(self):
+        return self._n
+
+
+class _Model:
+    def __init__(self, params):
+        self._params = params
+
+    def parameters(self):
+        return iter(self._params)
+
+
+def test_checkpoint_bytes_estimate_follows_the_runners_size_model():
+    from veri_runner.training_runtime import estimate_checkpoint_bytes
+
+    full = _Model([_Param(3 * 10**9), _Param(10**9)])
+    assert estimate_checkpoint_bytes(full) == 6 * 4 * 10**9, "6 B/param bf16 full fine-tune"
+    assert estimate_checkpoint_bytes(full, fsdp=True) == 8 * 4 * 10**9, "+2N pytorch_model_fsdp.bin"
+    lora = _Model([_Param(4 * 10**9, requires_grad=False), _Param(20 * 10**6)])
+    assert estimate_checkpoint_bytes(lora) == 10 * 20 * 10**6, "adapters: only the trainable params"
+
+
+def test_disk_guard_turns_saves_off_when_three_checkpoints_do_not_fit(tmp_path):
+    """BAD: a 7B full fine-tune on Vast (100 GB) wrote 42 GB checkpoints until
+    ENOSPC killed the run. GOOD: the guard disables periodic saves up front,
+    says why, and raises checkpoint_disabled_disk; the final artifact is
+    unaffected. The control plane's local_disk_gb hint bounds a container's
+    optimistic df."""
+    from veri_runner.training_runtime import apply_checkpoint_disk_guard
+
+    events = []
+    model = _Model([_Param(7 * 10**9)])  # 42 GB per checkpoint, 126 GB for three
+    on = ENABLED | {"local_disk_gb": 100}
+    out = apply_checkpoint_disk_guard(
+        on, model, str(tmp_path), logging.getLogger("t"),
+        lambda t, m, meta: events.append((t, m, meta)), free_bytes=10**12,
+    )
+    assert out["save_strategy"] == "no" and out["enabled"] is False
+    assert events[0][0] == "checkpoint_disabled_disk"
+    assert events[0][2]["checkpoint_bytes"] == 42 * 10**9 and events[0][2]["level"] == "warning"
+    assert "exceeds 100.0 GB" in events[0][1]
+
+    fits = apply_checkpoint_disk_guard(
+        on, model, str(tmp_path), logging.getLogger("t"), events.append, free_bytes=10**12
+    )
+    assert fits is on or fits["enabled"] is False  # still bounded by the 100 GB hint
+    big = ENABLED | {"local_disk_gb": 256}
+    assert apply_checkpoint_disk_guard(
+        big, model, str(tmp_path), logging.getLogger("t"), None, free_bytes=150 * 10**9
+    ) is big, "126 GB fits in 150 GB free"
+    assert apply_checkpoint_disk_guard(None, model, str(tmp_path), logging.getLogger("t")) is None
+    off = {"enabled": False, "save_strategy": "no"}
+    assert apply_checkpoint_disk_guard(off, model, str(tmp_path), logging.getLogger("t")) is off
+
+
+# ---- C2: GRPO save cadence on a generation boundary ----
+
+
+def test_grpo_step_cadence_is_rounded_up_to_a_generation_boundary():
+    from veri_runner.training_runtime import grpo_aligned_save_steps
+
+    assert grpo_aligned_save_steps(50, {}) == 50, "period 1: untouched"
+    assert grpo_aligned_save_steps(50, {"gradient_accumulation_steps": 8}) == 56
+    assert grpo_aligned_save_steps(50, {"steps_per_generation": 4, "num_iterations": 3}) == 60
+    assert grpo_aligned_save_steps(60, {"steps_per_generation": 4, "num_iterations": 3}) == 60
+    kwargs = build_grpo_config_kwargs(
+        job_id="j", hyperparameters={"gradient_accumulation_steps": 8},
+        grpo_config_cls=_AllKnobs, checkpoint=dict(ENABLED, save_steps=50),
+    )
+    assert kwargs["save_steps"] == 56
+    ratio = build_grpo_config_kwargs(
+        job_id="j", hyperparameters={"gradient_accumulation_steps": 8},
+        grpo_config_cls=_AllKnobs, checkpoint=ENABLED,
+    )
+    assert ratio["save_steps"] == 0.1, "a fraction is left to HF"
+
+
+# ---- C0 events from a multi-GPU rank ----
+
+
+def test_rank_zero_progress_file_carries_events(tmp_path):
+    from veri_runner.training_runtime import RankZeroProgressFile
+
+    pf = RankZeroProgressFile(str(tmp_path / "progress.jsonl"))
+    pf.step(1, 10, {"loss": 1.0})
+    pf.event("checkpoint_disabled_disk", "no room", {"free_bytes": 1, "level": "warning"})
+    import json
+
+    records = [json.loads(line) for line in (tmp_path / "progress.jsonl").read_text().splitlines()]
+    assert records[1]["event"] == "checkpoint_disabled_disk"
+    assert records[1]["metadata"] == {"free_bytes": 1, "level": "warning"}
+    assert "step" not in records[1], "an event record is not a progress record"
