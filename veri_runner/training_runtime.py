@@ -803,13 +803,96 @@ def _merge_adapter_from_path(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     log.info("Merging adapter %s into %s -> %s", adapter_dir, base_model, merged_dir)
+    # low_cpu_mem_usage: the base is materialized shard by shard instead of
+    # twice (random init + load), so a 4B bf16 base needs ~8 GB of host RAM,
+    # not 16, on a 16 GB L4 box.
     base = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=torch.bfloat16, trust_remote_code=_allow_remote_code(base_model)
+        base_model,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=_allow_remote_code(base_model),
     )
     merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
     merged.save_pretrained(merged_dir)
     AutoTokenizer.from_pretrained(adapter_dir).save_pretrained(merged_dir)
     return merged_dir
+
+
+def merged_weights_dir(final_dir: str) -> str:
+    """Where a LoRA run's standalone weights live: a sibling of the adapter
+    checkpoint ({root}/{job_id}/merged next to {root}/{job_id}/final). The
+    worker uploads it to jobs/{id}/final/merged/, next to final/hf/."""
+    return str(Path(final_dir).parent / "merged")
+
+
+def _has_standalone_weights(model_dir: str) -> bool:
+    p = Path(model_dir)
+    return (p / "config.json").is_file() and any(p.glob("*.safetensors"))
+
+
+def materialize_merged_weights(
+    *,
+    job_config: dict[str, Any],
+    final_dir: str,
+    trainer: Any = None,
+    tokenizer: Any = None,
+    logger: logging.Logger | None = None,
+) -> str | None:
+    """VS-559: standalone (merged) weights for a LoRA run, next to the adapter.
+
+    Before this, the only merge ran for `hf_push artifact="merged"`, so a
+    LoRA job could be served only by pushing to Hugging Face and deploying
+    that repo. Now every LoRA run materializes merged_weights_dir(final_dir)
+    and the worker uploads it to jobs/{id}/final/merged/; the control plane
+    deploys a LoRA job from there. The adapter checkpoint (final_dir) is left
+    exactly as it was, so push/export of the adapter still work.
+
+    Returns the merged dir, or None when there is nothing to merge (a full
+    fine-tune has no adapter_config.json) or the merge failed: the run has
+    already succeeded, so a merge error is logged, never raised. Idempotent:
+    an existing merged dir is reused, and push_to_hf_hub reuses it too, so
+    the adapter is merged at most once per run.
+
+    Which merge: with the trained model still in this process the adapter is
+    merged in place on the GPU (no extra host RAM; `save_pretrained_merged`
+    for unsloth, PEFT's merge_and_unload otherwise). A 4-bit (QLoRA) base
+    merged in place would save 4-bit weights, which the serving path does not
+    load, so QLoRA reloads the base in bf16 from disk (low_cpu_mem_usage) and
+    applies the saved adapter, as the multi-GPU parent (no trainer) does.
+    """
+    log = logger or logging.getLogger("veri.training_runtime")
+    if not (Path(final_dir) / "adapter_config.json").is_file():
+        return None
+    merged_dir = merged_weights_dir(final_dir)
+    if _has_standalone_weights(merged_dir):
+        return merged_dir
+    hp = job_config.get("hyperparameters") or {}
+    model = getattr(trainer, "model", None) if trainer is not None else None
+    in_process = model is not None and (
+        hasattr(model, "save_pretrained_merged") or not hp.get("load_in_4bit")
+    )
+    try:
+        if in_process:
+            log.info("Merging the LoRA adapter in process -> %s", merged_dir)
+            _save_merged_for_push(
+                trainer=trainer, tokenizer=tokenizer, merged_dir=merged_dir, log=log
+            )
+        else:
+            _merge_adapter_from_path(
+                base_model=job_config["base_model"],
+                adapter_dir=final_dir,
+                merged_dir=merged_dir,
+                log=log,
+            )
+        return merged_dir
+    except Exception as e:  # noqa: BLE001 -- the adapter upload must still happen
+        log.warning(
+            "Merged weights were not materialized (non-fatal; the adapter "
+            "checkpoint is uploaded as usual and this job will not deploy "
+            "directly): %s",
+            e,
+        )
+        return None
 
 
 def push_to_hf_hub(
@@ -858,6 +941,11 @@ def push_to_hf_hub(
                 )
                 return None
             upload_dir = final_dir
+        elif is_adapter_ckpt and _has_standalone_weights(merged_weights_dir(final_dir)):
+            # VS-559: materialize_merged_weights already merged this run's
+            # adapter (and merge_and_unload consumed the in-process adapters),
+            # so push that dir rather than merging again.
+            upload_dir = merged_weights_dir(final_dir)
         elif is_adapter_ckpt and trainer is None:
             # VS-476: the worker parent pushes after a multi-GPU run from the
             # saved adapter; no trainer lives in this process, so merge from
@@ -1547,6 +1635,20 @@ def _train_save_finalize(
         "checkpoint_dir": final_dir,
         "checkpoint": job_config.get("checkpoint"),
     }
+    if not distributed:
+        # VS-559: a LoRA run also leaves standalone weights for the worker to
+        # upload (jobs/{id}/final/merged/), merged in process while the model
+        # is still on the GPU. Under the launcher the parent merges from the
+        # saved adapter once the ranks have exited.
+        merged_dir = materialize_merged_weights(
+            job_config=job_config,
+            final_dir=final_dir,
+            trainer=trainer,
+            tokenizer=tokenizer,
+            logger=log,
+        )
+        if merged_dir:
+            result["merged_dir"] = merged_dir
     if distributed:
         result["world_size"] = int(launch_plan["world_size"])
         result["plan"] = launch_plan.get("summary")
