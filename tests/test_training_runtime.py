@@ -515,6 +515,115 @@ def test_sft_trainer_builds_and_truncates_under_unsloth_padding_free_rule(tmp_pa
     assert tuple(batch["input_ids"].shape) == (1, 64)
 
 
+# VS-600: an unsloth bf16 full fine-tune keeps norm weights in fp32 and runs the
+# model under bf16 autocast through a class-level forward wrapper (unsloth_zoo
+# 2026.7.4 training_utils.py:207-229, 437-444); unsloth also turns the Trainer's
+# own autocast off for it (unsloth/models/rl.py:1045-1050). TRL 1.7.1 defaults
+# SFTConfig.loss_type to "chunked_nll" (sft_config.py:335-336), which sets an
+# instance-level model.forward that calls the backbone directly
+# (sft_trainer.py:377, 311), so the wrapper never runs and the fp32 norm output
+# meets a bf16 q_proj: prod jobs 628e9921d200 (DO) and 4d5cd4950604 (AWS).
+class _TrlLossTypeSFTConfig:
+    def __init__(self, packing=None, max_length=None, padding_free=None, loss_type=None):
+        pass
+
+
+def test_build_sft_config_kwargs_unsloth_full_finetune_uses_nll_loss():
+    full = build_sft_config_kwargs(
+        job_id="j",
+        hyperparameters={"use_unsloth": True, "max_steps": 20},
+        sft_config_cls=_TrlLossTypeSFTConfig,
+    )
+    assert full["loss_type"] == "nll"
+
+
+def test_build_sft_config_kwargs_keeps_trl_default_loss_off_unsloth_full_finetune():
+    # LoRA / QLoRA under unsloth keep the Trainer's autocast (proven: DO job
+    # 74477db58ff1) and the vanilla path has no fp32 norms: TRL's default stays.
+    for hp in (
+        {"use_unsloth": True, "lora_rank": 16},
+        {"use_unsloth": True, "lora_rank": 16, "load_in_4bit": True},
+        {},
+        {"lora_rank": 16},
+    ):
+        kwargs = build_sft_config_kwargs(
+            job_id="j", hyperparameters=hp, sft_config_cls=_TrlLossTypeSFTConfig
+        )
+        assert "loss_type" not in kwargs, hp
+
+    # A TRL without loss_type (pre-1.x has no chunked forward) is left alone.
+    old = build_sft_config_kwargs(
+        job_id="j", hyperparameters={"use_unsloth": True}, sft_config_cls=_UnslothLikeSFTConfig
+    )
+    assert "loss_type" not in old
+
+
+def _unsloth_bf16_full_finetune_prep(model):
+    """What unsloth_zoo 2026.7.4 prepare_model_for_training(full_finetuning=True,
+    float32_mixed_precision=False) does to a bf16 model: norm weights upcast to
+    fp32 (training_utils.py:398-404), then forward runs under bf16 autocast via a
+    swapped-in subclass (training_utils.py:207-229)."""
+    import functools
+
+    import torch
+
+    for name, param in model.named_parameters():
+        if "norm." in name:
+            param.data = param.data.to(torch.float32)
+    base = type(model)
+
+    @functools.wraps(base.forward)
+    def forward(self, *args, **kwargs):
+        device_type = next(self.parameters()).device.type
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            return base.forward(self, *args, **kwargs)
+
+    model.__class__ = type(base.__name__, (base,), {"forward": forward})
+    return model
+
+
+def test_sft_trainer_trains_unsloth_bf16_full_finetune(tmp_path):
+    # Real TRL (the fleet pins trl==1.7.1); skipped where the training stack is absent.
+    pytest.importorskip("trl")
+    pytest.importorskip("tokenizers")
+    import math
+
+    import torch
+    from datasets import Dataset
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+    from trl import SFTConfig, SFTTrainer
+
+    words = [f"w{i}" for i in range(40)]
+    vocab = {"<pad>": 0, "<eos>": 1, "<unk>": 2, **{w: i + 3 for i, w in enumerate(words)}}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
+    )
+    torch.manual_seed(0)
+    model = Qwen3ForCausalLM(Qwen3Config(
+        vocab_size=len(vocab), hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8, max_position_embeddings=128,
+    )).to(torch.bfloat16)
+    _unsloth_bf16_full_finetune_prep(model)
+
+    # The prod repro's knobs: use_unsloth, no lora_rank (full fine-tune).
+    hp = {"use_unsloth": True, "max_steps": 1, "batch_size": 2}
+    kwargs = build_sft_config_kwargs(
+        job_id="j", hyperparameters=hp, sft_config_cls=SFTConfig, output_root=str(tmp_path),
+    )
+    # unsloth sets bf16 off for a bf16 full fine-tune (rl.py:1045-1050); CPU here.
+    config = SFTConfig(**{**kwargs, "bf16": False, "use_cpu": True})
+    trainer = SFTTrainer(
+        model=model, args=config, processing_class=tokenizer,
+        train_dataset=Dataset.from_list([{"text": "w1 w2 w3 w4"}, {"text": "w5 w6 w7"}]),
+    )
+    result = trainer.train()
+    assert result.global_step == 1
+    assert math.isfinite(result.training_loss)
+
+
 class _ChatTemplateTok:
     """Mimics tokenizer.apply_chat_template with a deterministic rendering."""
 

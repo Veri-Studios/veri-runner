@@ -620,6 +620,16 @@ def build_sft_config_kwargs(
     # blocks with max_length, so it is left alone.
     if "padding_free" in sft_params and not packing:
         config_kwargs["padding_free"] = False
+    # VS-600: an unsloth bf16 full fine-tune keeps its norm weights in fp32 and
+    # runs the forward under bf16 autocast through a class-level wrapper
+    # (unsloth_zoo 2026.7.4 training_utils.py:207-229, 437-444), with the
+    # Trainer's own autocast off (unsloth rl.py:1045-1050). TRL 1.7.1's default
+    # loss_type "chunked_nll" sets an instance-level model.forward that calls
+    # the backbone directly (sft_trainer.py:311, 377), so the wrapper never runs
+    # and the fp32 norm output hits a bf16 q_proj ("float != BFloat16"). "nll"
+    # keeps unsloth's own forward and fused loss.
+    if "loss_type" in sft_params and _unsloth_full_finetune(hyperparameters):
+        config_kwargs["loss_type"] = "nll"
     if "dataset_text_field" in sft_params:
         config_kwargs["dataset_text_field"] = hyperparameters.get("dataset_text_field", "text")
     # TRL renamed max_seq_length -> max_length; set whichever the version exposes.
@@ -1063,6 +1073,16 @@ def _model_placement(
     return dtype, device_map
 
 
+def _unsloth_full_finetune(hyperparameters: dict[str, Any]) -> bool:
+    """True when the job loads through unsloth with full_finetuning=True (no
+    LoRA adapters; 4-bit without lora_rank is rejected in the loader)."""
+    return (
+        bool(hyperparameters.get("use_unsloth", False))
+        and hyperparameters.get("lora_rank") is None
+        and not hyperparameters.get("load_in_4bit", False)
+    )
+
+
 def _load_model_and_tokenizer(
     base_model: str,
     hyperparameters: dict[str, Any],
@@ -1117,7 +1137,7 @@ def _load_model_and_tokenizer(
                 model_name=base_model,
                 max_seq_length=max_seq_length,
                 load_in_4bit=load_in_4bit,
-                full_finetuning=(lora_rank is None and not load_in_4bit),
+                full_finetuning=_unsloth_full_finetune(hyperparameters),
             )
             if lora_rank is not None:
                 model = FastLanguageModel.get_peft_model(
