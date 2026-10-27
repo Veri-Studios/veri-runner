@@ -1278,6 +1278,48 @@ def _prepare_trl_framework(hyperparameters: dict[str, Any], log: logging.Logger)
     return use_unsloth
 
 
+def _emit_event(
+    event_fn: Callable[[str, str, dict], None] | None,
+    event_type: str,
+    message: str,
+    metadata: dict[str, Any],
+    log: logging.Logger,
+) -> None:
+    """One job event through the adapter's channel; telemetry never fails a run."""
+    if event_fn is None:
+        return
+    try:
+        event_fn(event_type, message, metadata)
+    except Exception as e:  # noqa: BLE001
+        log.warning("event %s not reported: %s", event_type, e)
+
+
+def _load_model_reporting(
+    base_model: str,
+    hyperparameters: dict[str, Any],
+    log: logging.Logger,
+    *,
+    event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
+    **load_kwargs: Any,
+) -> tuple[Any, Any]:
+    """The shared model load of every TRL method: the worker's prefetch hook
+    first (weights into the HF cache, reported as model_download_*), then the
+    load, then `model_loaded` {duration_s}. Called after the rows are
+    validated, so a bad dataset still fails before any download."""
+    if model_prefetch_fn is not None:
+        model_prefetch_fn(base_model)
+    t0 = time.perf_counter()
+    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log, **load_kwargs)
+    seconds = time.perf_counter() - t0
+    log.info("Model loaded in %.1fs", seconds)
+    _emit_event(
+        event_fn, "model_loaded", f"Model loaded in {seconds:.1f}s",
+        {"duration_s": round(seconds, 3)}, log,
+    )
+    return model, tokenizer
+
+
 def _attach_progress_callback(
     trainer: Any,
     progress_fn: Callable[[int, int, dict], None] | None,
@@ -1694,6 +1736,8 @@ def run_grpo_training(
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
     # C0: job events (type, message, metadata) -> the control plane.
     event_fn: Callable[[str, str, dict], None] | None = None,
+    # the worker's HF prefetch (model_download_* events); None loads directly
+    model_prefetch_fn: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Run shared GRPO training semantics for a concrete runner adapter."""
     log = logger or logging.getLogger("veri.training_runtime")
@@ -1736,9 +1780,9 @@ def run_grpo_training(
     rows = _apply_system_prompt(rows, hyperparameters.get("system_prompt"))
     dataset = Dataset.from_list(rows)
 
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
-    log.info("Model loaded in %.1fs", time.time() - t0)
+    model, tokenizer = _load_model_reporting(
+        base_model, hyperparameters, log, event_fn=event_fn, model_prefetch_fn=model_prefetch_fn
+    )
     if after_model_load:
         after_model_load()
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
@@ -2016,6 +2060,7 @@ def run_grpo_harness_training(
     # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
     event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Harness-in-the-loop GRPO: the user's unmodified agent harness
     drives multi-turn rollouts against the in-training policy.
@@ -2117,6 +2162,9 @@ def run_grpo_harness_training(
             server_dp,
             list(range(1 + len(server_devices), gpu_count)),
         )
+    if model_prefetch_fn is not None:
+        # before the policy server: it loads the same weights from the cache
+        model_prefetch_fn(base_model)
     server_proc, policy_url = _launch_policy_server(
         base_model=base_model,
         devices=server_devices,
@@ -2127,9 +2175,7 @@ def run_grpo_harness_training(
     )
     # Model + tokenizer load before the proxy: the proxy decodes completion
     # ids into the OpenAI-shaped response text (TRL's /chat/ returns ids only).
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
-    log.info("Model loaded in %.1fs", time.time() - t0)
+    model, tokenizer = _load_model_reporting(base_model, hyperparameters, log, event_fn=event_fn)
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
         job_config.get("checkpoint"), model, checkpoint_output_root(job_config), log, event_fn
     )
@@ -2293,6 +2339,7 @@ def run_sft_text_training(
     launch_plan: dict[str, Any] | None = None,
     phase_fn: Callable[[str, int], None] | None = None,
     event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Supervised fine-tuning on text via TRL SFTTrainer.
@@ -2329,11 +2376,10 @@ def run_sft_text_training(
     )
     validate_rows_for_method(rows, "sft_text")
 
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(
-        base_model, hyperparameters, log, launch_plan=launch_plan
+    model, tokenizer = _load_model_reporting(
+        base_model, hyperparameters, log, event_fn=event_fn,
+        model_prefetch_fn=model_prefetch_fn, launch_plan=launch_plan,
     )
-    log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
@@ -2422,6 +2468,7 @@ def run_dpo_training(
     launch_plan: dict[str, Any] | None = None,
     phase_fn: Callable[[str, int], None] | None = None,
     event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Direct Preference Optimization via TRL DPOTrainer.
@@ -2460,11 +2507,10 @@ def run_dpo_training(
     validate_rows_for_method(rows, "dpo")
     dataset = Dataset.from_list(rows)
 
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(
-        base_model, hyperparameters, log, launch_plan=launch_plan
+    model, tokenizer = _load_model_reporting(
+        base_model, hyperparameters, log, event_fn=event_fn,
+        model_prefetch_fn=model_prefetch_fn, launch_plan=launch_plan,
     )
-    log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
