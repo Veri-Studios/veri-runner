@@ -16,6 +16,7 @@ from __future__ import annotations
 # imports unsloth (patches the trainer) BEFORE importing trl; the vanilla base path
 # uses _ensure_vanilla_trl_imports() (a minimal vLLM-symbol shim) instead. Base
 # stays vanilla TRL + transformers; users own optimization-framework deps.
+import functools
 import importlib.util
 import inspect
 import json
@@ -1320,42 +1321,217 @@ def _load_model_reporting(
     return model, tokenizer
 
 
+class StepPhaseTimer:
+    """Wall seconds per optimizer step for the `time/*` metric keys.
+
+    on_step_begin..on_step_end is the step (time/step_s). While it runs, the
+    wrapped trainer methods accumulate generation (time/gen_s), reward
+    (time/reward_s) and vLLM weight sync (time/weight_sync_s) seconds; the
+    rest is the update (time/update_s, clamped at 0). TRL's _generate calls
+    the weight sync itself, so the sync is taken out of the generation time
+    and counted once. A key is reported only for a phase the trainer has.
+    Steps finished between two logs report their mean (HF averages the loss
+    the same way). The save window (on_step_end with should_save .. on_save)
+    is time/checkpoint_save_s."""
+
+    PHASES = ("gen", "reward", "weight_sync")
+
+    def __init__(self) -> None:
+        self._clock = time.perf_counter
+        self._lock = threading.Lock()
+        self._seen: set[str] = set()
+        self._acc = dict.fromkeys(self.PHASES, 0.0)
+        self._step_t0: float | None = None
+        self._window: list[dict[str, float]] = []
+        self._save_t0: float | None = None
+
+    def wrap(self, phase: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            t0 = self._clock()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                with self._lock:
+                    self._acc[phase] += self._clock() - t0
+
+        self._seen.add(phase)
+        return functools.wraps(fn)(timed)
+
+    def step_begin(self) -> None:
+        with self._lock:
+            self._step_t0 = self._clock()
+            self._acc = dict.fromkeys(self.PHASES, 0.0)
+
+    def step_end(self) -> float | None:
+        """Close the step; its wall seconds (None without a matching begin)."""
+        with self._lock:
+            if self._step_t0 is None:
+                return None
+            step_s = self._clock() - self._step_t0
+            self._step_t0 = None
+            sync = self._acc["weight_sync"]
+            row = {"time/step_s": step_s}
+            if "gen" in self._seen:
+                row["time/gen_s"] = max(0.0, self._acc["gen"] - sync)
+            if "reward" in self._seen:
+                row["time/reward_s"] = self._acc["reward"]
+            if "weight_sync" in self._seen:
+                row["time/weight_sync_s"] = sync
+            row["time/update_s"] = max(
+                0.0,
+                step_s - row.get("time/gen_s", 0.0) - row.get("time/reward_s", 0.0) - sync,
+            )
+            self._window.append(row)
+            return step_s
+
+    def pop_window(self) -> dict[str, float]:
+        """Mean of the steps finished since the last call ({} when none)."""
+        with self._lock:
+            rows, self._window = self._window, []
+        if not rows:
+            return {}
+        return {k: sum(r[k] for r in rows) / len(rows) for k in rows[-1]}
+
+    def save_begin(self) -> None:
+        self._save_t0 = self._clock()
+
+    @property
+    def saving(self) -> bool:
+        return self._save_t0 is not None
+
+    def save_end(self) -> float | None:
+        if self._save_t0 is None:
+            return None
+        seconds, self._save_t0 = self._clock() - self._save_t0, None
+        return seconds
+
+
+def _instrument_trainer_phases(trainer: Any, timer: StepPhaseTimer) -> None:
+    """Wrap the TRL 1.7.1 GRPOTrainer methods each phase runs in (generation:
+    `_generate`, which also runs a harness's rollout_func; rewards:
+    `_calculate_rewards`; weight sync: `vllm_generation.sync_weights`).
+    Fail-soft: SFT/DPO trainers and other TRL versions simply lack them."""
+    for attr, phase in (("_generate", "gen"), ("_calculate_rewards", "reward")):
+        fn = getattr(trainer, attr, None)
+        if callable(fn):
+            try:
+                setattr(trainer, attr, timer.wrap(phase, fn))
+            except Exception:  # noqa: BLE001
+                pass
+    vllm = getattr(trainer, "vllm_generation", None)
+    sync = getattr(vllm, "sync_weights", None)
+    if callable(sync):
+        try:
+            vllm.sync_weights = timer.wrap("weight_sync", sync)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _peak_memory_metrics() -> dict[str, float]:
+    """sys/gpu.{i}.mem_peak_bytes of this process's GPU, when torch is loaded."""
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return {}
+    try:
+        if not torch.cuda.is_available():
+            return {}
+        device = torch.cuda.current_device()
+        return {f"sys/gpu.{device}.mem_peak_bytes": float(torch.cuda.max_memory_allocated(device))}
+    except Exception:  # noqa: BLE001 -- telemetry
+        return {}
+
+
 def _attach_progress_callback(
     trainer: Any,
     progress_fn: Callable[[int, int, dict], None] | None,
     phase_fn: Callable[[str, int], None] | None = None,
+    event_fn: Callable[[str, str, dict], None] | None = None,
 ) -> None:
     """Register step-level progress reporting on any HF Trainer (no-op when
-    the adapter didn't pass a progress_fn).
+    the adapter passed no progress_fn, phase_fn or event_fn).
 
     Multi-process (VS-476): every rank runs the callbacks, only the world's
     process zero reports. `phase_fn` marks the save window ("saving" from the
     step whose save is pending until on_save, then "training") so the parent's
     stall watchdog can stretch its budget around a long FULL_STATE_DICT write
     instead of killing a healthy job.
+
+    Each logged step also carries the `time/*` keys (StepPhaseTimer), time/ts
+    and the process's peak GPU memory. HF logs a save step BEFORE it saves,
+    so that row is held until on_save adds time/checkpoint_save_s. Events:
+    first_step {step_s, step} once, checkpoint_saved {step, local_save_s}.
     """
-    if not progress_fn and not phase_fn:
+    if not progress_fn and not phase_fn and not event_fn:
         return
     from transformers import TrainerCallback
+
+    log = logging.getLogger("veri.training_runtime")
+    timer = StepPhaseTimer()
+    _instrument_trainer_phases(trainer, timer)
 
     def _main(state) -> bool:
         return bool(getattr(state, "is_world_process_zero", True))
 
     class _ProgressCallback(TrainerCallback):
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs and state and progress_fn and _main(state):
-                progress_fn(state.global_step, state.max_steps, {
-                    k: float(v) for k, v in logs.items()
-                    if isinstance(v, (int, float))
-                })
+        def __init__(self) -> None:
+            self._held: tuple[int, int, dict] | None = None
+            self._first_step_reported = False
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            timer.step_begin()
 
         def on_step_end(self, args, state, control, **kwargs):
-            if phase_fn and _main(state) and getattr(control, "should_save", False):
-                phase_fn("saving", int(state.global_step))
+            step_s = timer.step_end()
+            if not _main(state):
+                return
+            step = int(state.global_step)
+            if step_s is not None and not self._first_step_reported:
+                self._first_step_reported = True
+                _emit_event(
+                    event_fn, "first_step", f"First step took {step_s:.1f}s",
+                    {"step_s": round(step_s, 3), "step": step}, log,
+                )
+            if getattr(control, "should_save", False):
+                timer.save_begin()
+                if phase_fn:
+                    phase_fn("saving", step)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not (logs and state and progress_fn and _main(state)):
+                return
+            metrics = {k: float(v) for k, v in logs.items() if isinstance(v, (int, float))}
+            metrics.update(timer.pop_window())
+            metrics["time/ts"] = time.time()
+            metrics.update(_peak_memory_metrics())
+            if timer.saving:
+                self._held = (state.global_step, state.max_steps, metrics)
+                return
+            progress_fn(state.global_step, state.max_steps, metrics)
 
         def on_save(self, args, state, control, **kwargs):
-            if phase_fn and _main(state):
-                phase_fn("training", int(state.global_step))
+            save_s = timer.save_end()
+            if not _main(state):
+                return
+            step = int(state.global_step)
+            if phase_fn:
+                phase_fn("training", step)
+            if save_s is None:
+                return
+            _emit_event(
+                event_fn, "checkpoint_saved", f"Checkpoint step-{step} saved in {save_s:.1f}s",
+                {"step": step, "local_save_s": round(save_s, 3)}, log,
+            )
+            if progress_fn:
+                held, self._held = self._held, None
+                if held is None:
+                    held = (step, state.max_steps, {"time/ts": time.time()})
+                held[2]["time/checkpoint_save_s"] = save_s
+                progress_fn(*held)
+
+        def on_train_end(self, args, state, control, **kwargs):
+            held, self._held = self._held, None
+            if held is not None and progress_fn:
+                progress_fn(*held)
 
     trainer.add_callback(_ProgressCallback())
 
@@ -1811,7 +1987,7 @@ def run_grpo_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn)
+    _attach_progress_callback(trainer, progress_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
@@ -2280,7 +2456,7 @@ def run_grpo_harness_training(
     trainer_kwargs["rollout_func"] = rollout_func
     trainer = GRPOTrainer(**trainer_kwargs)
 
-    _attach_progress_callback(trainer, progress_fn)
+    _attach_progress_callback(trainer, progress_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     try:
         return _train_save_finalize(
@@ -2419,7 +2595,7 @@ def run_sft_text_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
+    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
@@ -2539,7 +2715,7 @@ def run_dpo_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
+    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,

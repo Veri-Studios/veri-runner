@@ -850,7 +850,13 @@ def test_progress_callback_is_gated_on_rank_zero_and_reports_phases(monkeypatch)
     cb.on_log(None, _State(True), ctl, logs={"loss": 1.5, "epoch": 0.1, "text": "x"})
     cb.on_step_end(None, _State(True), ctl)
     cb.on_save(None, _State(True), ctl)
-    assert steps == [(3, 10, {"loss": 1.5, "epoch": 0.1})]
+    # numeric logs only (+ time/ts); the save adds a row with its own seconds
+    assert [(s, t) for s, t, _ in steps] == [(3, 10), (3, 10)]
+    logged, saved = steps[0][2], steps[1][2]
+    assert {k: v for k, v in logged.items() if not k.startswith("time/")} == {
+        "loss": 1.5, "epoch": 0.1,
+    }
+    assert "time/ts" in logged and "time/checkpoint_save_s" in saved
     assert phases == [("saving", 3), ("training", 3)]
     # no save pending -> no phase line
     cb.on_step_end(None, _State(True), types.SimpleNamespace(should_save=False))
