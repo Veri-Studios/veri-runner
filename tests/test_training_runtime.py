@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from veri_runner.training_runtime import (
-    MILES_REWARD_UNSUPPORTED,
     _apply_system_prompt,
     _load_model_and_tokenizer,
     _require_preference_columns,
@@ -102,7 +101,7 @@ def test_load_reward_function_rejects_unsupported_miles_rewards(tmp_path):
         load_reward_function(
             str(reward_file),
             reward_format="miles",
-            unsupported_formats={"miles": MILES_REWARD_UNSUPPORTED},
+            unsupported_formats={"miles": "Miles reward format is not supported here"},
         )
 
 

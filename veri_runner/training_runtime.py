@@ -42,13 +42,6 @@ def _gpu_supports_bf16() -> bool:
     return False
 
 
-MILES_REWARD_UNSUPPORTED = (
-    "Miles reward format is not supported on NVIDIA GPUs. "
-    "Upload a TRL-format reward function instead: "
-    "def reward(completions, answer, **kwargs) -> list[float]"
-)
-
-
 def load_reward_function(
     reward_path: str,
     *,

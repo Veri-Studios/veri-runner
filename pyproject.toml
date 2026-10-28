@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "The training runtime that executes Veri jobs on GPU workers: trajectory capture, harness rollouts, and TRL method dispatch"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.11"
+# 3.10 is what the fleet runs: the AWS AMI (Ubuntu 22.04) and the Vast image
+# (py310 base) both execute this runtime under it.
+requires-python = ">=3.10"
 # The runtime's heavy dependencies (torch, trl, transformers, datasets, vllm)
 # are provided by the worker image and imported lazily per training method.
 # The package itself is import-clean on plain Python, which is what lets the
@@ -25,7 +27,7 @@ dev = [
 packages = ["veri_runner"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
