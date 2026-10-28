@@ -515,6 +515,115 @@ def test_sft_trainer_builds_and_truncates_under_unsloth_padding_free_rule(tmp_pa
     assert tuple(batch["input_ids"].shape) == (1, 64)
 
 
+# VS-600: an unsloth bf16 full fine-tune keeps norm weights in fp32 and runs the
+# model under bf16 autocast through a class-level forward wrapper (unsloth_zoo
+# 2026.7.4 training_utils.py:207-229, 437-444); unsloth also turns the Trainer's
+# own autocast off for it (unsloth/models/rl.py:1045-1050). TRL 1.7.1 defaults
+# SFTConfig.loss_type to "chunked_nll" (sft_config.py:335-336), which sets an
+# instance-level model.forward that calls the backbone directly
+# (sft_trainer.py:377, 311), so the wrapper never runs and the fp32 norm output
+# meets a bf16 q_proj: prod jobs 628e9921d200 (DO) and 4d5cd4950604 (AWS).
+class _TrlLossTypeSFTConfig:
+    def __init__(self, packing=None, max_length=None, padding_free=None, loss_type=None):
+        pass
+
+
+def test_build_sft_config_kwargs_unsloth_full_finetune_uses_nll_loss():
+    full = build_sft_config_kwargs(
+        job_id="j",
+        hyperparameters={"use_unsloth": True, "max_steps": 20},
+        sft_config_cls=_TrlLossTypeSFTConfig,
+    )
+    assert full["loss_type"] == "nll"
+
+
+def test_build_sft_config_kwargs_keeps_trl_default_loss_off_unsloth_full_finetune():
+    # LoRA / QLoRA under unsloth keep the Trainer's autocast (proven: DO job
+    # 74477db58ff1) and the vanilla path has no fp32 norms: TRL's default stays.
+    for hp in (
+        {"use_unsloth": True, "lora_rank": 16},
+        {"use_unsloth": True, "lora_rank": 16, "load_in_4bit": True},
+        {},
+        {"lora_rank": 16},
+    ):
+        kwargs = build_sft_config_kwargs(
+            job_id="j", hyperparameters=hp, sft_config_cls=_TrlLossTypeSFTConfig
+        )
+        assert "loss_type" not in kwargs, hp
+
+    # A TRL without loss_type (pre-1.x has no chunked forward) is left alone.
+    old = build_sft_config_kwargs(
+        job_id="j", hyperparameters={"use_unsloth": True}, sft_config_cls=_UnslothLikeSFTConfig
+    )
+    assert "loss_type" not in old
+
+
+def _unsloth_bf16_full_finetune_prep(model):
+    """What unsloth_zoo 2026.7.4 prepare_model_for_training(full_finetuning=True,
+    float32_mixed_precision=False) does to a bf16 model: norm weights upcast to
+    fp32 (training_utils.py:398-404), then forward runs under bf16 autocast via a
+    swapped-in subclass (training_utils.py:207-229)."""
+    import functools
+
+    import torch
+
+    for name, param in model.named_parameters():
+        if "norm." in name:
+            param.data = param.data.to(torch.float32)
+    base = type(model)
+
+    @functools.wraps(base.forward)
+    def forward(self, *args, **kwargs):
+        device_type = next(self.parameters()).device.type
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            return base.forward(self, *args, **kwargs)
+
+    model.__class__ = type(base.__name__, (base,), {"forward": forward})
+    return model
+
+
+def test_sft_trainer_trains_unsloth_bf16_full_finetune(tmp_path):
+    # Real TRL (the fleet pins trl==1.7.1); skipped where the training stack is absent.
+    pytest.importorskip("trl")
+    pytest.importorskip("tokenizers")
+    import math
+
+    import torch
+    from datasets import Dataset
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+    from trl import SFTConfig, SFTTrainer
+
+    words = [f"w{i}" for i in range(40)]
+    vocab = {"<pad>": 0, "<eos>": 1, "<unk>": 2, **{w: i + 3 for i, w in enumerate(words)}}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
+    )
+    torch.manual_seed(0)
+    model = Qwen3ForCausalLM(Qwen3Config(
+        vocab_size=len(vocab), hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8, max_position_embeddings=128,
+    )).to(torch.bfloat16)
+    _unsloth_bf16_full_finetune_prep(model)
+
+    # The prod repro's knobs: use_unsloth, no lora_rank (full fine-tune).
+    hp = {"use_unsloth": True, "max_steps": 1, "batch_size": 2}
+    kwargs = build_sft_config_kwargs(
+        job_id="j", hyperparameters=hp, sft_config_cls=SFTConfig, output_root=str(tmp_path),
+    )
+    # unsloth sets bf16 off for a bf16 full fine-tune (rl.py:1045-1050); CPU here.
+    config = SFTConfig(**{**kwargs, "bf16": False, "use_cpu": True})
+    trainer = SFTTrainer(
+        model=model, args=config, processing_class=tokenizer,
+        train_dataset=Dataset.from_list([{"text": "w1 w2 w3 w4"}, {"text": "w5 w6 w7"}]),
+    )
+    result = trainer.train()
+    assert result.global_step == 1
+    assert math.isfinite(result.training_loss)
+
+
 class _ChatTemplateTok:
     """Mimics tokenizer.apply_chat_template with a deterministic rendering."""
 
@@ -1812,3 +1921,225 @@ def test_train_save_finalize_threads_hf_repo_url(tmp_path, monkeypatch):
     print("finalize result ->", {k: result[k] for k in ("final_loss", "hf_repo_url")})
     assert result["hf_repo_url"] == "https://huggingface.co/me/final"
     assert record["upload"]["repo_id"] == "me/final"
+
+
+import os  # noqa: E402
+import types  # noqa: E402
+
+# ---- VS-559: merged weights materialized next to the adapter checkpoint ----
+#
+# The merge that `hf_push artifact="merged"` already does now runs for every
+# LoRA run, writes {final}/../merged, and the push reuses that dir instead of
+# merging a second time.
+
+
+class _MergedBase:
+    """What merge_and_unload / save_pretrained_merged hand back: a standalone
+    model whose save writes config + weights."""
+
+    def save_pretrained(self, out_dir):
+        import os
+
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "config.json"), "w") as f:
+            f.write('{"architectures": ["Qwen3ForCausalLM"]}')
+        with open(os.path.join(out_dir, "model.safetensors"), "wb") as f:
+            f.write(b"merged-weights")
+
+
+class _PeftModel:
+    def __init__(self, counter):
+        self.counter = counter
+
+    def merge_and_unload(self):
+        self.counter["merges"] += 1
+        return _MergedBase()
+
+
+class _Tokenizer:
+    def save_pretrained(self, out_dir):
+        import os
+
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "tokenizer.json"), "w") as f:
+            f.write("{}")
+
+
+def _adapter_final_dir(tmp_path):
+    final = tmp_path / "j1" / "final"
+    final.mkdir(parents=True)
+    (final / "adapter_config.json").write_text("{}")
+    (final / "adapter_model.safetensors").write_text("a")
+    return final
+
+
+def test_materialize_merged_weights_writes_a_standalone_dir_next_to_the_adapter(tmp_path):
+    from veri_runner.training_runtime import materialize_merged_weights
+
+    final = _adapter_final_dir(tmp_path)
+    counter = {"merges": 0}
+    trainer = types.SimpleNamespace(model=_PeftModel(counter))
+
+    merged = materialize_merged_weights(
+        job_config={
+            "job_id": "j1",
+            "base_model": "Qwen/Qwen3-0.6B",
+            "hyperparameters": {"lora_rank": 8},
+        },
+        final_dir=str(final),
+        trainer=trainer,
+        tokenizer=_Tokenizer(),
+    )
+
+    print("materialized ->", merged, sorted(os.listdir(merged)))
+    assert merged == str(tmp_path / "j1" / "merged")
+    assert sorted(os.listdir(merged)) == ["config.json", "model.safetensors", "tokenizer.json"]
+    assert counter["merges"] == 1
+    # the adapter checkpoint is untouched: final/hf/ keeps serving push/export
+    assert sorted(os.listdir(final)) == ["adapter_config.json", "adapter_model.safetensors"]
+
+
+def test_materialize_merged_weights_is_a_noop_for_a_full_fine_tune(tmp_path):
+    """BAD guard: a standalone checkpoint has nothing to merge; the trainer is
+    never touched and no merged dir appears."""
+    from veri_runner.training_runtime import materialize_merged_weights
+
+    final = tmp_path / "j2" / "final"
+    final.mkdir(parents=True)
+    (final / "config.json").write_text("{}")
+    (final / "model.safetensors").write_text("w")
+    counter = {"merges": 0}
+
+    out = materialize_merged_weights(
+        job_config={"job_id": "j2", "base_model": "Qwen/Qwen3-0.6B"},
+        final_dir=str(final),
+        trainer=types.SimpleNamespace(model=_PeftModel(counter)),
+        tokenizer=_Tokenizer(),
+    )
+    assert out is None and counter["merges"] == 0
+    assert not (tmp_path / "j2" / "merged").exists()
+
+
+def test_materialize_merged_weights_never_fails_the_run(tmp_path):
+    """The run already succeeded when the merge runs: a merge error logs and
+    returns None (the worker then uploads the adapter alone, as before)."""
+    from veri_runner.training_runtime import materialize_merged_weights
+
+    final = _adapter_final_dir(tmp_path)
+
+    class Exploding:
+        def merge_and_unload(self):
+            raise RuntimeError("CUDA out of memory")
+
+    out = materialize_merged_weights(
+        job_config={"job_id": "j1", "base_model": "Qwen/Qwen3-0.6B"},
+        final_dir=str(final),
+        trainer=types.SimpleNamespace(model=Exploding()),
+        tokenizer=_Tokenizer(),
+    )
+    assert out is None
+
+
+def test_materialize_merged_weights_merges_qlora_from_a_fresh_base(tmp_path, monkeypatch):
+    """A 4-bit (QLoRA) base merged in place yields 4-bit weights vLLM's default
+    loader does not serve; the merge reloads the base in bf16 from disk
+    (low_cpu_mem_usage) and applies the saved adapter, like the multi-GPU
+    parent does."""
+    from veri_runner import training_runtime as rt
+
+    final = _adapter_final_dir(tmp_path)
+    seen = {}
+
+    def from_path(*, base_model, adapter_dir, merged_dir, log):
+        seen.update(base_model=base_model, adapter_dir=adapter_dir)
+        _MergedBase().save_pretrained(merged_dir)
+        return merged_dir
+
+    monkeypatch.setattr(rt, "_merge_adapter_from_path", from_path)
+    counter = {"merges": 0}
+    out = rt.materialize_merged_weights(
+        job_config={
+            "job_id": "j1",
+            "base_model": "Qwen/Qwen3-4B",
+            "hyperparameters": {"lora_rank": 16, "load_in_4bit": True},
+        },
+        final_dir=str(final),
+        trainer=types.SimpleNamespace(model=_PeftModel(counter)),
+        tokenizer=_Tokenizer(),
+    )
+    assert out == str(tmp_path / "j1" / "merged")
+    assert seen == {"base_model": "Qwen/Qwen3-4B", "adapter_dir": str(final)}
+    assert counter["merges"] == 0, "the 4-bit in-process model must not be merged in place"
+
+
+def test_push_to_hf_hub_reuses_the_materialized_merged_dir(tmp_path, monkeypatch):
+    """GOOD: after materialize, a merged push uploads that dir and merges
+    nothing a second time (the in-place merge_and_unload has already
+    consumed the trainer's adapters)."""
+    from veri_runner.training_runtime import materialize_merged_weights
+
+    record = {}
+    _fake_hub(monkeypatch, record)
+    final = _adapter_final_dir(tmp_path)
+    counter = {"merges": 0}
+    trainer = types.SimpleNamespace(model=_PeftModel(counter))
+    cfg = {
+        "job_id": "j1",
+        "base_model": "Qwen/Qwen3-0.6B",
+        "hf_push": {"repo": "me/out", "artifact": "merged"},
+        "hf_token": "hf_secret",
+    }
+    merged = materialize_merged_weights(
+        job_config=cfg, final_dir=str(final), trainer=trainer, tokenizer=_Tokenizer()
+    )
+
+    url = push_to_hf_hub(
+        job_config=cfg, final_dir=str(final), trainer=trainer, tokenizer=_Tokenizer()
+    )
+
+    print("push reused ->", record["upload"]["folder_path"], "merges:", counter["merges"])
+    assert url == "https://huggingface.co/me/out"
+    assert record["upload"]["folder_path"] == merged
+    assert counter["merges"] == 1
+
+
+def test_train_save_finalize_materializes_merged_weights_for_a_lora_run(tmp_path, monkeypatch):
+    """The shared TRL tail reports merged_dir so the worker can upload it;
+    a full fine-tune reports none."""
+    from veri_runner import training_runtime as rt
+
+    calls = []
+
+    def fake_materialize(*, job_config, final_dir, trainer=None, tokenizer=None, logger=None):
+        calls.append(final_dir)
+        lora = job_config.get("hyperparameters", {}).get("lora_rank")
+        return str(tmp_path / "merged") if lora else None
+
+    monkeypatch.setattr(rt, "materialize_merged_weights", fake_materialize)
+    monkeypatch.setattr(rt, "push_to_hf_hub", lambda **kw: None)
+
+    class Trainer:
+        def train(self):
+            return types.SimpleNamespace(training_loss=0.1)
+
+        def save_model(self, d):
+            os.makedirs(d, exist_ok=True)
+
+    def run(hp):
+        return rt._train_save_finalize(
+            trainer=Trainer(),
+            tokenizer=_Tokenizer(),
+            job_config={
+                "job_id": "jfin",
+                "hyperparameters": hp,
+                "checkpoint": {"local_output_root": str(tmp_path / "ckpts")},
+            },
+            wandb_enabled=False,
+            log=logging.getLogger("t"),
+        )
+
+    lora = run({"lora_rank": 8})
+    assert lora["merged_dir"] == str(tmp_path / "merged")
+    full = run({})
+    assert "merged_dir" not in full
+    assert calls == [lora["checkpoint_dir"], full["checkpoint_dir"]]

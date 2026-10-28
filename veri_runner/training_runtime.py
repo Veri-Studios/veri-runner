@@ -16,6 +16,7 @@ from __future__ import annotations
 # imports unsloth (patches the trainer) BEFORE importing trl; the vanilla base path
 # uses _ensure_vanilla_trl_imports() (a minimal vLLM-symbol shim) instead. Base
 # stays vanilla TRL + transformers; users own optimization-framework deps.
+import functools
 import importlib.util
 import inspect
 import json
@@ -619,6 +620,16 @@ def build_sft_config_kwargs(
     # blocks with max_length, so it is left alone.
     if "padding_free" in sft_params and not packing:
         config_kwargs["padding_free"] = False
+    # VS-600: an unsloth bf16 full fine-tune keeps its norm weights in fp32 and
+    # runs the forward under bf16 autocast through a class-level wrapper
+    # (unsloth_zoo 2026.7.4 training_utils.py:207-229, 437-444), with the
+    # Trainer's own autocast off (unsloth rl.py:1045-1050). TRL 1.7.1's default
+    # loss_type "chunked_nll" sets an instance-level model.forward that calls
+    # the backbone directly (sft_trainer.py:311, 377), so the wrapper never runs
+    # and the fp32 norm output hits a bf16 q_proj ("float != BFloat16"). "nll"
+    # keeps unsloth's own forward and fused loss.
+    if "loss_type" in sft_params and _unsloth_full_finetune(hyperparameters):
+        config_kwargs["loss_type"] = "nll"
     if "dataset_text_field" in sft_params:
         config_kwargs["dataset_text_field"] = hyperparameters.get("dataset_text_field", "text")
     # TRL renamed max_seq_length -> max_length; set whichever the version exposes.
@@ -803,13 +814,96 @@ def _merge_adapter_from_path(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     log.info("Merging adapter %s into %s -> %s", adapter_dir, base_model, merged_dir)
+    # low_cpu_mem_usage: the base is materialized shard by shard instead of
+    # twice (random init + load), so a 4B bf16 base needs ~8 GB of host RAM,
+    # not 16, on a 16 GB L4 box.
     base = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=torch.bfloat16, trust_remote_code=_allow_remote_code(base_model)
+        base_model,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=_allow_remote_code(base_model),
     )
     merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
     merged.save_pretrained(merged_dir)
     AutoTokenizer.from_pretrained(adapter_dir).save_pretrained(merged_dir)
     return merged_dir
+
+
+def merged_weights_dir(final_dir: str) -> str:
+    """Where a LoRA run's standalone weights live: a sibling of the adapter
+    checkpoint ({root}/{job_id}/merged next to {root}/{job_id}/final). The
+    worker uploads it to jobs/{id}/final/merged/, next to final/hf/."""
+    return str(Path(final_dir).parent / "merged")
+
+
+def _has_standalone_weights(model_dir: str) -> bool:
+    p = Path(model_dir)
+    return (p / "config.json").is_file() and any(p.glob("*.safetensors"))
+
+
+def materialize_merged_weights(
+    *,
+    job_config: dict[str, Any],
+    final_dir: str,
+    trainer: Any = None,
+    tokenizer: Any = None,
+    logger: logging.Logger | None = None,
+) -> str | None:
+    """VS-559: standalone (merged) weights for a LoRA run, next to the adapter.
+
+    Before this, the only merge ran for `hf_push artifact="merged"`, so a
+    LoRA job could be served only by pushing to Hugging Face and deploying
+    that repo. Now every LoRA run materializes merged_weights_dir(final_dir)
+    and the worker uploads it to jobs/{id}/final/merged/; the control plane
+    deploys a LoRA job from there. The adapter checkpoint (final_dir) is left
+    exactly as it was, so push/export of the adapter still work.
+
+    Returns the merged dir, or None when there is nothing to merge (a full
+    fine-tune has no adapter_config.json) or the merge failed: the run has
+    already succeeded, so a merge error is logged, never raised. Idempotent:
+    an existing merged dir is reused, and push_to_hf_hub reuses it too, so
+    the adapter is merged at most once per run.
+
+    Which merge: with the trained model still in this process the adapter is
+    merged in place on the GPU (no extra host RAM; `save_pretrained_merged`
+    for unsloth, PEFT's merge_and_unload otherwise). A 4-bit (QLoRA) base
+    merged in place would save 4-bit weights, which the serving path does not
+    load, so QLoRA reloads the base in bf16 from disk (low_cpu_mem_usage) and
+    applies the saved adapter, as the multi-GPU parent (no trainer) does.
+    """
+    log = logger or logging.getLogger("veri.training_runtime")
+    if not (Path(final_dir) / "adapter_config.json").is_file():
+        return None
+    merged_dir = merged_weights_dir(final_dir)
+    if _has_standalone_weights(merged_dir):
+        return merged_dir
+    hp = job_config.get("hyperparameters") or {}
+    model = getattr(trainer, "model", None) if trainer is not None else None
+    in_process = model is not None and (
+        hasattr(model, "save_pretrained_merged") or not hp.get("load_in_4bit")
+    )
+    try:
+        if in_process:
+            log.info("Merging the LoRA adapter in process -> %s", merged_dir)
+            _save_merged_for_push(
+                trainer=trainer, tokenizer=tokenizer, merged_dir=merged_dir, log=log
+            )
+        else:
+            _merge_adapter_from_path(
+                base_model=job_config["base_model"],
+                adapter_dir=final_dir,
+                merged_dir=merged_dir,
+                log=log,
+            )
+        return merged_dir
+    except Exception as e:  # noqa: BLE001 -- the adapter upload must still happen
+        log.warning(
+            "Merged weights were not materialized (non-fatal; the adapter "
+            "checkpoint is uploaded as usual and this job will not deploy "
+            "directly): %s",
+            e,
+        )
+        return None
 
 
 def push_to_hf_hub(
@@ -858,6 +952,11 @@ def push_to_hf_hub(
                 )
                 return None
             upload_dir = final_dir
+        elif is_adapter_ckpt and _has_standalone_weights(merged_weights_dir(final_dir)):
+            # VS-559: materialize_merged_weights already merged this run's
+            # adapter (and merge_and_unload consumed the in-process adapters),
+            # so push that dir rather than merging again.
+            upload_dir = merged_weights_dir(final_dir)
         elif is_adapter_ckpt and trainer is None:
             # VS-476: the worker parent pushes after a multi-GPU run from the
             # saved adapter; no trainer lives in this process, so merge from
@@ -974,6 +1073,16 @@ def _model_placement(
     return dtype, device_map
 
 
+def _unsloth_full_finetune(hyperparameters: dict[str, Any]) -> bool:
+    """True when the job loads through unsloth with full_finetuning=True (no
+    LoRA adapters; 4-bit without lora_rank is rejected in the loader)."""
+    return (
+        bool(hyperparameters.get("use_unsloth", False))
+        and hyperparameters.get("lora_rank") is None
+        and not hyperparameters.get("load_in_4bit", False)
+    )
+
+
 def _load_model_and_tokenizer(
     base_model: str,
     hyperparameters: dict[str, Any],
@@ -1028,7 +1137,7 @@ def _load_model_and_tokenizer(
                 model_name=base_model,
                 max_seq_length=max_seq_length,
                 load_in_4bit=load_in_4bit,
-                full_finetuning=(lora_rank is None and not load_in_4bit),
+                full_finetuning=_unsloth_full_finetune(hyperparameters),
             )
             if lora_rank is not None:
                 model = FastLanguageModel.get_peft_model(
@@ -1190,42 +1299,259 @@ def _prepare_trl_framework(hyperparameters: dict[str, Any], log: logging.Logger)
     return use_unsloth
 
 
+def _emit_event(
+    event_fn: Callable[[str, str, dict], None] | None,
+    event_type: str,
+    message: str,
+    metadata: dict[str, Any],
+    log: logging.Logger,
+) -> None:
+    """One job event through the adapter's channel; telemetry never fails a run."""
+    if event_fn is None:
+        return
+    try:
+        event_fn(event_type, message, metadata)
+    except Exception as e:  # noqa: BLE001
+        log.warning("event %s not reported: %s", event_type, e)
+
+
+def _load_model_reporting(
+    base_model: str,
+    hyperparameters: dict[str, Any],
+    log: logging.Logger,
+    *,
+    event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
+    **load_kwargs: Any,
+) -> tuple[Any, Any]:
+    """The shared model load of every TRL method: the worker's prefetch hook
+    first (weights into the HF cache, reported as model_download_*), then the
+    load, then `model_loaded` {duration_s}. Called after the rows are
+    validated, so a bad dataset still fails before any download."""
+    if model_prefetch_fn is not None:
+        model_prefetch_fn(base_model)
+    t0 = time.perf_counter()
+    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log, **load_kwargs)
+    seconds = time.perf_counter() - t0
+    log.info("Model loaded in %.1fs", seconds)
+    _emit_event(
+        event_fn, "model_loaded", f"Model loaded in {seconds:.1f}s",
+        {"duration_s": round(seconds, 3)}, log,
+    )
+    return model, tokenizer
+
+
+class StepPhaseTimer:
+    """Wall seconds per optimizer step for the `time/*` metric keys.
+
+    on_step_begin..on_step_end is the step (time/step_s). While it runs, the
+    wrapped trainer methods accumulate generation (time/gen_s), reward
+    (time/reward_s) and vLLM weight sync (time/weight_sync_s) seconds; the
+    rest is the update (time/update_s, clamped at 0). TRL's _generate calls
+    the weight sync itself, so the sync is taken out of the generation time
+    and counted once. A key is reported only for a phase the trainer has.
+    Steps finished between two logs report their mean (HF averages the loss
+    the same way). The save window (on_step_end with should_save .. on_save)
+    is time/checkpoint_save_s."""
+
+    PHASES = ("gen", "reward", "weight_sync")
+
+    def __init__(self) -> None:
+        self._clock = time.perf_counter
+        self._lock = threading.Lock()
+        self._seen: set[str] = set()
+        self._acc = dict.fromkeys(self.PHASES, 0.0)
+        self._step_t0: float | None = None
+        self._window: list[dict[str, float]] = []
+        self._save_t0: float | None = None
+
+    def wrap(self, phase: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            t0 = self._clock()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                with self._lock:
+                    self._acc[phase] += self._clock() - t0
+
+        self._seen.add(phase)
+        return functools.wraps(fn)(timed)
+
+    def step_begin(self) -> None:
+        with self._lock:
+            self._step_t0 = self._clock()
+            self._acc = dict.fromkeys(self.PHASES, 0.0)
+
+    def step_end(self) -> float | None:
+        """Close the step; its wall seconds (None without a matching begin)."""
+        with self._lock:
+            if self._step_t0 is None:
+                return None
+            step_s = self._clock() - self._step_t0
+            self._step_t0 = None
+            sync = self._acc["weight_sync"]
+            row = {"time/step_s": step_s}
+            if "gen" in self._seen:
+                row["time/gen_s"] = max(0.0, self._acc["gen"] - sync)
+            if "reward" in self._seen:
+                row["time/reward_s"] = self._acc["reward"]
+            if "weight_sync" in self._seen:
+                row["time/weight_sync_s"] = sync
+            row["time/update_s"] = max(
+                0.0,
+                step_s - row.get("time/gen_s", 0.0) - row.get("time/reward_s", 0.0) - sync,
+            )
+            self._window.append(row)
+            return step_s
+
+    def pop_window(self) -> dict[str, float]:
+        """Mean of the steps finished since the last call ({} when none)."""
+        with self._lock:
+            rows, self._window = self._window, []
+        if not rows:
+            return {}
+        return {k: sum(r[k] for r in rows) / len(rows) for k in rows[-1]}
+
+    def save_begin(self) -> None:
+        self._save_t0 = self._clock()
+
+    @property
+    def saving(self) -> bool:
+        return self._save_t0 is not None
+
+    def save_end(self) -> float | None:
+        if self._save_t0 is None:
+            return None
+        seconds, self._save_t0 = self._clock() - self._save_t0, None
+        return seconds
+
+
+def _instrument_trainer_phases(trainer: Any, timer: StepPhaseTimer) -> None:
+    """Wrap the TRL 1.7.1 GRPOTrainer methods each phase runs in (generation:
+    `_generate`, which also runs a harness's rollout_func; rewards:
+    `_calculate_rewards`; weight sync: `vllm_generation.sync_weights`).
+    Fail-soft: SFT/DPO trainers and other TRL versions simply lack them."""
+    for attr, phase in (("_generate", "gen"), ("_calculate_rewards", "reward")):
+        fn = getattr(trainer, attr, None)
+        if callable(fn):
+            try:
+                setattr(trainer, attr, timer.wrap(phase, fn))
+            except Exception:  # noqa: BLE001
+                pass
+    vllm = getattr(trainer, "vllm_generation", None)
+    sync = getattr(vllm, "sync_weights", None)
+    if callable(sync):
+        try:
+            vllm.sync_weights = timer.wrap("weight_sync", sync)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _peak_memory_metrics() -> dict[str, float]:
+    """sys/gpu.{i}.mem_peak_bytes of this process's GPU, when torch is loaded."""
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return {}
+    try:
+        if not torch.cuda.is_available():
+            return {}
+        device = torch.cuda.current_device()
+        return {f"sys/gpu.{device}.mem_peak_bytes": float(torch.cuda.max_memory_allocated(device))}
+    except Exception:  # noqa: BLE001 -- telemetry
+        return {}
+
+
 def _attach_progress_callback(
     trainer: Any,
     progress_fn: Callable[[int, int, dict], None] | None,
     phase_fn: Callable[[str, int], None] | None = None,
+    event_fn: Callable[[str, str, dict], None] | None = None,
 ) -> None:
     """Register step-level progress reporting on any HF Trainer (no-op when
-    the adapter didn't pass a progress_fn).
+    the adapter passed no progress_fn, phase_fn or event_fn).
 
     Multi-process (VS-476): every rank runs the callbacks, only the world's
     process zero reports. `phase_fn` marks the save window ("saving" from the
     step whose save is pending until on_save, then "training") so the parent's
     stall watchdog can stretch its budget around a long FULL_STATE_DICT write
     instead of killing a healthy job.
+
+    Each logged step also carries the `time/*` keys (StepPhaseTimer), time/ts
+    and the process's peak GPU memory. HF logs a save step BEFORE it saves,
+    so that row is held until on_save adds time/checkpoint_save_s. Events:
+    first_step {step_s, step} once, checkpoint_saved {step, local_save_s}.
     """
-    if not progress_fn and not phase_fn:
+    if not progress_fn and not phase_fn and not event_fn:
         return
     from transformers import TrainerCallback
+
+    log = logging.getLogger("veri.training_runtime")
+    timer = StepPhaseTimer()
+    _instrument_trainer_phases(trainer, timer)
 
     def _main(state) -> bool:
         return bool(getattr(state, "is_world_process_zero", True))
 
     class _ProgressCallback(TrainerCallback):
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs and state and progress_fn and _main(state):
-                progress_fn(state.global_step, state.max_steps, {
-                    k: float(v) for k, v in logs.items()
-                    if isinstance(v, (int, float))
-                })
+        def __init__(self) -> None:
+            self._held: tuple[int, int, dict] | None = None
+            self._first_step_reported = False
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            timer.step_begin()
 
         def on_step_end(self, args, state, control, **kwargs):
-            if phase_fn and _main(state) and getattr(control, "should_save", False):
-                phase_fn("saving", int(state.global_step))
+            step_s = timer.step_end()
+            if not _main(state):
+                return
+            step = int(state.global_step)
+            if step_s is not None and not self._first_step_reported:
+                self._first_step_reported = True
+                _emit_event(
+                    event_fn, "first_step", f"First step took {step_s:.1f}s",
+                    {"step_s": round(step_s, 3), "step": step}, log,
+                )
+            if getattr(control, "should_save", False):
+                timer.save_begin()
+                if phase_fn:
+                    phase_fn("saving", step)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not (logs and state and progress_fn and _main(state)):
+                return
+            metrics = {k: float(v) for k, v in logs.items() if isinstance(v, (int, float))}
+            metrics.update(timer.pop_window())
+            metrics["time/ts"] = time.time()
+            metrics.update(_peak_memory_metrics())
+            if timer.saving:
+                self._held = (state.global_step, state.max_steps, metrics)
+                return
+            progress_fn(state.global_step, state.max_steps, metrics)
 
         def on_save(self, args, state, control, **kwargs):
-            if phase_fn and _main(state):
-                phase_fn("training", int(state.global_step))
+            save_s = timer.save_end()
+            if not _main(state):
+                return
+            step = int(state.global_step)
+            if phase_fn:
+                phase_fn("training", step)
+            if save_s is None:
+                return
+            _emit_event(
+                event_fn, "checkpoint_saved", f"Checkpoint step-{step} saved in {save_s:.1f}s",
+                {"step": step, "local_save_s": round(save_s, 3)}, log,
+            )
+            if progress_fn:
+                held, self._held = self._held, None
+                if held is None:
+                    held = (step, state.max_steps, {"time/ts": time.time()})
+                held[2]["time/checkpoint_save_s"] = save_s
+                progress_fn(*held)
+
+        def on_train_end(self, args, state, control, **kwargs):
+            held, self._held = self._held, None
+            if held is not None and progress_fn:
+                progress_fn(*held)
 
     trainer.add_callback(_ProgressCallback())
 
@@ -1547,6 +1873,20 @@ def _train_save_finalize(
         "checkpoint_dir": final_dir,
         "checkpoint": job_config.get("checkpoint"),
     }
+    if not distributed:
+        # VS-559: a LoRA run also leaves standalone weights for the worker to
+        # upload (jobs/{id}/final/merged/), merged in process while the model
+        # is still on the GPU. Under the launcher the parent merges from the
+        # saved adapter once the ranks have exited.
+        merged_dir = materialize_merged_weights(
+            job_config=job_config,
+            final_dir=final_dir,
+            trainer=trainer,
+            tokenizer=tokenizer,
+            logger=log,
+        )
+        if merged_dir:
+            result["merged_dir"] = merged_dir
     if distributed:
         result["world_size"] = int(launch_plan["world_size"])
         result["plan"] = launch_plan.get("summary")
@@ -1592,6 +1932,8 @@ def run_grpo_training(
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
     # C0: job events (type, message, metadata) -> the control plane.
     event_fn: Callable[[str, str, dict], None] | None = None,
+    # the worker's HF prefetch (model_download_* events); None loads directly
+    model_prefetch_fn: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Run shared GRPO training semantics for a concrete runner adapter."""
     log = logger or logging.getLogger("veri.training_runtime")
@@ -1634,9 +1976,9 @@ def run_grpo_training(
     rows = _apply_system_prompt(rows, hyperparameters.get("system_prompt"))
     dataset = Dataset.from_list(rows)
 
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
-    log.info("Model loaded in %.1fs", time.time() - t0)
+    model, tokenizer = _load_model_reporting(
+        base_model, hyperparameters, log, event_fn=event_fn, model_prefetch_fn=model_prefetch_fn
+    )
     if after_model_load:
         after_model_load()
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
@@ -1665,7 +2007,7 @@ def run_grpo_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn)
+    _attach_progress_callback(trainer, progress_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
@@ -1914,6 +2256,7 @@ def run_grpo_harness_training(
     # adapter (worker_agent.upload_step_checkpoint); None disables uploading.
     checkpoint_upload_fn: Callable[[str, int], None] | None = None,
     event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Harness-in-the-loop GRPO: the user's unmodified agent harness
     drives multi-turn rollouts against the in-training policy.
@@ -2015,6 +2358,9 @@ def run_grpo_harness_training(
             server_dp,
             list(range(1 + len(server_devices), gpu_count)),
         )
+    if model_prefetch_fn is not None:
+        # before the policy server: it loads the same weights from the cache
+        model_prefetch_fn(base_model)
     server_proc, policy_url = _launch_policy_server(
         base_model=base_model,
         devices=server_devices,
@@ -2025,9 +2371,7 @@ def run_grpo_harness_training(
     )
     # Model + tokenizer load before the proxy: the proxy decodes completion
     # ids into the OpenAI-shaped response text (TRL's /chat/ returns ids only).
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(base_model, hyperparameters, log)
-    log.info("Model loaded in %.1fs", time.time() - t0)
+    model, tokenizer = _load_model_reporting(base_model, hyperparameters, log, event_fn=event_fn)
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
         job_config.get("checkpoint"), model, checkpoint_output_root(job_config), log, event_fn
     )
@@ -2132,7 +2476,7 @@ def run_grpo_harness_training(
     trainer_kwargs["rollout_func"] = rollout_func
     trainer = GRPOTrainer(**trainer_kwargs)
 
-    _attach_progress_callback(trainer, progress_fn)
+    _attach_progress_callback(trainer, progress_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     try:
         return _train_save_finalize(
@@ -2191,6 +2535,7 @@ def run_sft_text_training(
     launch_plan: dict[str, Any] | None = None,
     phase_fn: Callable[[str, int], None] | None = None,
     event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Supervised fine-tuning on text via TRL SFTTrainer.
@@ -2227,11 +2572,10 @@ def run_sft_text_training(
     )
     validate_rows_for_method(rows, "sft_text")
 
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(
-        base_model, hyperparameters, log, launch_plan=launch_plan
+    model, tokenizer = _load_model_reporting(
+        base_model, hyperparameters, log, event_fn=event_fn,
+        model_prefetch_fn=model_prefetch_fn, launch_plan=launch_plan,
     )
-    log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
@@ -2271,7 +2615,7 @@ def run_sft_text_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
+    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
@@ -2320,6 +2664,7 @@ def run_dpo_training(
     launch_plan: dict[str, Any] | None = None,
     phase_fn: Callable[[str, int], None] | None = None,
     event_fn: Callable[[str, str, dict], None] | None = None,
+    model_prefetch_fn: Callable[[str], Any] | None = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
     """Direct Preference Optimization via TRL DPOTrainer.
@@ -2358,11 +2703,10 @@ def run_dpo_training(
     validate_rows_for_method(rows, "dpo")
     dataset = Dataset.from_list(rows)
 
-    t0 = time.time()
-    model, tokenizer = _load_model_and_tokenizer(
-        base_model, hyperparameters, log, launch_plan=launch_plan
+    model, tokenizer = _load_model_reporting(
+        base_model, hyperparameters, log, event_fn=event_fn,
+        model_prefetch_fn=model_prefetch_fn, launch_plan=launch_plan,
     )
-    log.info("Model loaded in %.1fs", time.time() - t0)
     if after_model_load:
         after_model_load()
     job_config["checkpoint"] = apply_checkpoint_disk_guard(
@@ -2391,7 +2735,7 @@ def run_dpo_training(
         )
     )
 
-    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn)
+    _attach_progress_callback(trainer, progress_fn, phase_fn=phase_fn, event_fn=event_fn)
     _attach_checkpoint_uploader(trainer, job_config, checkpoint_upload_fn, log, event_fn)
     return _train_save_finalize(
         trainer=trainer,
