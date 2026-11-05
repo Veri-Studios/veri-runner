@@ -1602,7 +1602,8 @@ def stage_checkpoint(src: Path, stage_root: Path, step: int) -> Path:
             try:
                 os.link(name, target, src_dir_fd=dirfd, follow_symlinks=False)
             except OSError:
-                _copy_regular_file_at(dirfd, name, target, st)
+                if not _copy_regular_file_at(dirfd, name, target, st):
+                    log.warning("checkpoint step-%s: %s changed while staging; skipped", step, rel)
                 continue
             got = os.lstat(target)
             if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
@@ -1611,19 +1612,24 @@ def stage_checkpoint(src: Path, stage_root: Path, step: int) -> Path:
     return dst
 
 
-def _copy_regular_file_at(dirfd: int, name: str, target: Path, expect: os.stat_result) -> None:
+def _copy_regular_file_at(dirfd: int, name: str, target: Path, expect: os.stat_result) -> bool:
     """Copy `name` (relative to `dirfd`) to `target`, opened without following
-    a symlink and only if it is still the regular file `expect` describes."""
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+    a symlink and only if it is still the regular file `expect` describes.
+    False when it no longer is (nothing is copied)."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+    except OSError:
+        return False
     with open(fd, "rb") as f:
         got = os.fstat(fd)
         if not stat.S_ISREG(got.st_mode) or (got.st_dev, got.st_ino) != (
             expect.st_dev,
             expect.st_ino,
         ):
-            return
+            return False
         with open(target, "xb") as out:
             shutil.copyfileobj(f, out, 1 << 24)
+    return True
 
 
 class CheckpointUploadQueue:
