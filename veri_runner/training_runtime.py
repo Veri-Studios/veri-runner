@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -1558,21 +1559,71 @@ def stage_checkpoint(src: Path, stage_root: Path, step: int) -> Path:
     alive after the Trainer unlinks its names (verified: exp1_save_rotate,
     transformers 4.56.2) at no disk cost; a filesystem that refuses the link
     (EXDEV) gets a real copy instead.
+
+    Only regular files that really live inside `src` are staged. The walk
+    holds directory descriptors and never follows a symlink: a symlinked `src`
+    stages nothing, a symlinked subdirectory is not entered, and symlinks,
+    FIFOs, sockets and device files are skipped and logged. Each link is made
+    relative to its directory descriptor without following the name, and the
+    staged entry must be the inode that was checked, so a name swapped for a
+    symlink between the check and the link is dropped. `stage_root` must be a
+    real directory that only the caller writes to; a symlinked one is refused.
     """
+    log = logging.getLogger("veri.training_runtime")
+    stage_root.mkdir(parents=True, exist_ok=True)
+    if not stat.S_ISDIR(os.lstat(stage_root).st_mode):
+        raise NotADirectoryError(f"checkpoint stage root {stage_root} is not a real directory")
     dst = stage_root / f"step-{step}"
-    if dst.exists():
+    if dst.is_symlink():
+        dst.unlink()
+    elif dst.exists():
         shutil.rmtree(dst)
-    for p in src.rglob("*"):
-        rel = p.relative_to(src)
-        if p.is_dir():
-            (dst / rel).mkdir(parents=True, exist_ok=True)
-            continue
-        (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(p, dst / rel)
-        except OSError:
-            shutil.copy2(p, dst / rel)
+    dst.mkdir()
+    try:
+        src_is_dir = stat.S_ISDIR(os.lstat(src).st_mode)
+    except FileNotFoundError:
+        return dst
+    if not src_is_dir:
+        log.warning("checkpoint %s is not a real directory (a symlink?); skipped", src)
+        return dst
+    for dirpath, _dirnames, filenames, dirfd in os.fwalk(src, follow_symlinks=False):
+        out_dir = dst / Path(dirpath).relative_to(src)
+        out_dir.mkdir(exist_ok=True)
+        for name in filenames:
+            rel = out_dir.relative_to(dst) / name
+            try:
+                st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                log.warning("checkpoint step-%s: %s is not a regular file; skipped", step, rel)
+                continue
+            target = out_dir / name
+            try:
+                os.link(name, target, src_dir_fd=dirfd, follow_symlinks=False)
+            except OSError:
+                _copy_regular_file_at(dirfd, name, target, st)
+                continue
+            got = os.lstat(target)
+            if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+                target.unlink()
+                log.warning("checkpoint step-%s: %s changed while staging; skipped", step, rel)
     return dst
+
+
+def _copy_regular_file_at(dirfd: int, name: str, target: Path, expect: os.stat_result) -> None:
+    """Copy `name` (relative to `dirfd`) to `target`, opened without following
+    a symlink and only if it is still the regular file `expect` describes."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+    with open(fd, "rb") as f:
+        got = os.fstat(fd)
+        if not stat.S_ISREG(got.st_mode) or (got.st_dev, got.st_ino) != (
+            expect.st_dev,
+            expect.st_ino,
+        ):
+            return
+        with open(target, "xb") as out:
+            shutil.copyfileobj(f, out, 1 << 24)
 
 
 class CheckpointUploadQueue:
