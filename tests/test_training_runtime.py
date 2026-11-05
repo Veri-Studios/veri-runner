@@ -21,6 +21,7 @@ from veri_runner.training_runtime import (
     resolve_training_rows,
     run_training,
     save_checkpoint,
+    stage_checkpoint,
     validate_rows_for_method,
 )
 
@@ -2142,3 +2143,193 @@ def test_train_save_finalize_materializes_merged_weights_for_a_lora_run(tmp_path
     full = run({})
     assert "merged_dir" not in full
     assert calls == [lora["checkpoint_dir"], full["checkpoint_dir"]]
+
+
+# ---- stage_checkpoint: regular files only, never through a symlink ----
+#
+# The directory being staged is not always written by the runner itself: a
+# worker can watch a checkpoint directory that a user's training script fills.
+# Staging takes the regular files that really live inside checkpoint-N and
+# nothing else: no symlinked directory, no symlinked file (wherever it points,
+# `..` included), no FIFO or device file, and no name swapped for a symlink
+# between the check and the link.
+
+
+def _outside(tmp_path: Path) -> Path:
+    """A directory beside the checkpoints, holding a file no stage may contain."""
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / "secret.txt").write_bytes(b"not part of any checkpoint")
+    return out
+
+
+def _staged(stage: Path) -> dict:
+    """Every entry under a stage by relative path: file bytes, or its kind."""
+    got = {}
+    for p in sorted(stage.rglob("*")):
+        rel = str(p.relative_to(stage))
+        if p.is_symlink():
+            got[rel] = "symlink"
+        elif p.is_dir():
+            got[rel] = "dir"
+        elif p.is_file():
+            got[rel] = p.read_bytes()
+        else:
+            got[rel] = "special"
+    return got
+
+
+def _shares_an_inode_with(stage: Path, path: Path) -> bool:
+    target = os.stat(path)
+    return any(os.path.samestat(os.lstat(p), target) for p in stage.rglob("*"))
+
+
+def test_stage_checkpoint_stages_a_nested_checkpoint_in_full(tmp_path):
+    """GOOD path: nested directories and every byte, hard-linked (free on disk,
+    and the bytes outlive the Trainer deleting checkpoint-N)."""
+    src = tmp_path / "ckpts" / "checkpoint-1"
+    (src / "sub" / "deeper").mkdir(parents=True)
+    (src / "config.json").write_text("{}")
+    (src / "sub" / "model.safetensors").write_bytes(b"m" * 4096)
+    (src / "sub" / "deeper" / "optimizer.pt").write_bytes(b"o" * 8192)
+
+    stage = stage_checkpoint(src, tmp_path / "stage", 1)
+
+    assert stage == tmp_path / "stage" / "step-1"
+    assert _staged(stage) == {
+        "config.json": b"{}",
+        "sub": "dir",
+        "sub/deeper": "dir",
+        "sub/deeper/optimizer.pt": b"o" * 8192,
+        "sub/model.safetensors": b"m" * 4096,
+    }
+    assert os.path.samestat(
+        os.stat(stage / "sub" / "model.safetensors"), os.stat(src / "sub" / "model.safetensors")
+    )
+
+
+def test_stage_checkpoint_stages_nothing_from_a_symlinked_checkpoint_dir(tmp_path, caplog):
+    """BAD: checkpoint-1 is a symlink to a directory elsewhere and the walk went
+    through it, staging that directory's files. GOOD: nothing staged, logged."""
+    outside = _outside(tmp_path)
+    root = tmp_path / "ckpts"
+    root.mkdir()
+    (root / "checkpoint-1").symlink_to(outside, target_is_directory=True)
+
+    with caplog.at_level(logging.WARNING, logger="veri.training_runtime"):
+        stage = stage_checkpoint(root / "checkpoint-1", tmp_path / "stage", 1)
+
+    assert _staged(stage) == {}
+    assert not _shares_an_inode_with(stage, outside / "secret.txt")
+    assert "checkpoint-1" in caplog.text and "skipped" in caplog.text
+
+
+def test_stage_checkpoint_skips_a_symlinked_file_inside_a_real_checkpoint(tmp_path, caplog):
+    """BAD: a symlink among the checkpoint's files was hard-linked through to its
+    target. GOOD: only the real file is staged and the link is logged."""
+    outside = _outside(tmp_path)
+    src = tmp_path / "ckpts" / "checkpoint-2"
+    src.mkdir(parents=True)
+    (src / "model.safetensors").write_bytes(b"w" * 16)
+    (src / "extra.bin").symlink_to(outside / "secret.txt")
+
+    with caplog.at_level(logging.WARNING, logger="veri.training_runtime"):
+        stage = stage_checkpoint(src, tmp_path / "stage", 2)
+
+    assert _staged(stage) == {"model.safetensors": b"w" * 16}
+    assert not _shares_an_inode_with(stage, outside / "secret.txt")
+    assert "extra.bin" in caplog.text
+
+
+def test_stage_checkpoint_skips_links_that_climb_out_through_dotdot(tmp_path):
+    """Relative links that leave the checkpoint with `..`, to a file and to a
+    directory, stage nothing (not even an empty directory)."""
+    outside = _outside(tmp_path)
+    src = tmp_path / "ckpts" / "checkpoint-3"
+    (src / "nested").mkdir(parents=True)
+    (src / "nested" / "weights.bin").write_bytes(b"w")
+    up = Path("..") / ".." / ".."
+    (src / "nested" / "up.bin").symlink_to(up / "outside" / "secret.txt")
+    (src / "nested" / "updir").symlink_to(up / "outside", target_is_directory=True)
+    assert (src / "nested" / "up.bin").read_bytes() == b"not part of any checkpoint"
+
+    stage = stage_checkpoint(src, tmp_path / "stage", 3)
+
+    assert _staged(stage) == {"nested": "dir", "nested/weights.bin": b"w"}
+    assert not _shares_an_inode_with(stage, outside / "secret.txt")
+
+
+def test_stage_checkpoint_skips_fifos_and_other_special_files(tmp_path):
+    """Only regular files are checkpoint bytes; a FIFO would hang the reader."""
+    src = tmp_path / "ckpts" / "checkpoint-4"
+    src.mkdir(parents=True)
+    (src / "model.bin").write_bytes(b"w")
+    os.mkfifo(src / "pipe")
+
+    stage = stage_checkpoint(src, tmp_path / "stage", 4)
+
+    assert _staged(stage) == {"model.bin": b"w"}
+
+
+def test_stage_checkpoint_does_not_follow_a_name_swapped_for_a_symlink(tmp_path, monkeypatch):
+    """The file is checked, then linked. A symlink swapped in between must
+    neither stage its target nor leave a symlink in the stage."""
+    outside = _outside(tmp_path)
+    src = tmp_path / "ckpts" / "checkpoint-5"
+    src.mkdir(parents=True)
+    (src / "model.bin").write_bytes(b"w")
+    real_link = os.link
+
+    def swap_then_link(*args, **kwargs):
+        victim = src / "model.bin"
+        if not victim.is_symlink():
+            victim.unlink()
+            victim.symlink_to(outside / "secret.txt")
+        return real_link(*args, **kwargs)
+
+    monkeypatch.setattr(os, "link", swap_then_link)
+    stage = stage_checkpoint(src, tmp_path / "stage", 5)
+    monkeypatch.undo()
+
+    assert _staged(stage) == {}
+    assert not _shares_an_inode_with(stage, outside / "secret.txt")
+
+
+def test_stage_checkpoint_copies_when_links_are_refused_and_still_skips_symlinks(
+    tmp_path, monkeypatch
+):
+    """A filesystem that refuses the hard link (EXDEV) gets real copies, with
+    the same rule: regular files only, never a link's target."""
+    import errno
+
+    outside = _outside(tmp_path)
+    src = tmp_path / "ckpts" / "checkpoint-6"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "model.bin").write_bytes(b"m" * 64)
+    (src / "sub" / "extra.bin").symlink_to(outside / "secret.txt")
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", refuse)
+    stage = stage_checkpoint(src, tmp_path / "stage", 6)
+    monkeypatch.undo()
+
+    assert _staged(stage) == {"sub": "dir", "sub/model.bin": b"m" * 64}
+    staged, original = stage / "sub" / "model.bin", src / "sub" / "model.bin"
+    assert not os.path.samestat(os.stat(staged), os.stat(original))
+
+
+def test_stage_checkpoint_refuses_a_stage_root_that_is_a_symlink(tmp_path):
+    """The stage root must be a real directory: writing step-N through a
+    symlinked one would put files wherever that link points."""
+    outside = _outside(tmp_path)
+    src = tmp_path / "ckpts" / "checkpoint-7"
+    src.mkdir(parents=True)
+    (src / "model.bin").write_bytes(b"w")
+    (tmp_path / "stage").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        stage_checkpoint(src, tmp_path / "stage", 7)
+
+    assert sorted(p.name for p in outside.iterdir()) == ["secret.txt"]
