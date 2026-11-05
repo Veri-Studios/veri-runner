@@ -2333,3 +2333,34 @@ def test_stage_checkpoint_refuses_a_stage_root_that_is_a_symlink(tmp_path):
         stage_checkpoint(src, tmp_path / "stage", 7)
 
     assert sorted(p.name for p in outside.iterdir()) == ["secret.txt"]
+
+
+def test_stage_checkpoint_copy_fallback_skips_a_name_swapped_for_a_symlink(
+    tmp_path, monkeypatch
+):
+    """When links are refused the file is opened and copied instead. A symlink
+    swapped in before that open is skipped (not followed, not raised)."""
+    import errno
+
+    outside = _outside(tmp_path)
+    src = tmp_path / "ckpts" / "checkpoint-8"
+    src.mkdir(parents=True)
+    (src / "model.bin").write_bytes(b"w")
+    (src / "config.json").write_text("{}")
+
+    def swap_then_refuse(*args, **kwargs):
+        victim = src / "model.bin"
+        if not victim.is_symlink():
+            victim.unlink()
+            victim.symlink_to(outside / "secret.txt")
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", swap_then_refuse)
+    stage = stage_checkpoint(src, tmp_path / "stage", 8)
+    monkeypatch.undo()
+
+    assert "model.bin" not in _staged(stage)
+    assert not _shares_an_inode_with(stage, outside / "secret.txt")
+    assert b"not part of any checkpoint" not in b"".join(
+        p.read_bytes() for p in stage.rglob("*") if p.is_file()
+    )
