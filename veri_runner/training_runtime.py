@@ -1565,7 +1565,8 @@ def stage_checkpoint(src: Path, stage_root: Path, step: int) -> Path:
     stages nothing, a symlinked subdirectory is not entered, and symlinks,
     FIFOs, sockets and device files are skipped and logged. Each link is made
     relative to its directory descriptor without following the name, and the
-    staged entry must be the inode that was checked, so a name swapped for a
+    staged entry must be a regular file with the inode that was checked (a
+    freed inode number can be reused at once), so a name swapped for a
     symlink between the check and the link is dropped. `stage_root` must be a
     real directory that only the caller writes to; a symlinked one is refused.
     """
@@ -1606,7 +1607,10 @@ def stage_checkpoint(src: Path, stage_root: Path, step: int) -> Path:
                     log.warning("checkpoint step-%s: %s changed while staging; skipped", step, rel)
                 continue
             got = os.lstat(target)
-            if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino):
+            if not stat.S_ISREG(got.st_mode) or (got.st_dev, got.st_ino) != (
+                st.st_dev,
+                st.st_ino,
+            ):
                 target.unlink()
                 log.warning("checkpoint step-%s: %s changed while staging; skipped", step, rel)
     return dst
